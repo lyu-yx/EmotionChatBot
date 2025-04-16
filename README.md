@@ -24,7 +24,7 @@ A modular voice-interactive chatbot capable of real-time speech-to-text and text
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/EmotionChatBot.git
+git clone https://github.com/lyu-yx/EmotionChatBot.git
 cd EmotionChatBot
 ```
 
@@ -191,4 +191,4 @@ MIT
 
 ## Contributors
 
-- Your Name - Initial work
+- Yixuan - Initial work
