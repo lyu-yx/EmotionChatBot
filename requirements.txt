@@ -1,0 +1,37 @@
+# Core dependencies
+python-dotenv>=0.19.2
+requests>=2.27.1
+numpy>=1.20.0
+pyaudio>=0.2.11
+wave>=0.0.2
+soundfile>=0.10.3
+pydub>=0.25.1
+tqdm>=4.66.1
+pyyaml>=6.0.2
+speech_recognition>=3.8.1
+
+# Alibaba Cloud integrations
+dashscope>=1.10.0  # DashScope Python SDK for streaming
+
+# For TTS
+pyttsx3>=2.90
+
+# OpenAI integration (optional)
+openai>=1.0.0
+
+# Emotion detection (optional)
+opencv-python>=4.5.5
+deepface>=0.0.75
+
+# Machine learning
+torch>=2.1.0
+huggingface-hub>=0.17.3
+datasets>=2.14.0
+tokenizers>=0.14.1
+modelscope>=1.9.5
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# Note: ffmpeg is required but is installed as a system dependency, not via pip
+# See README.md for ffmpeg installation instructions

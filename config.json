@@ -1,0 +1,29 @@
+{
+  "system": {
+    "debug": false,
+    "exit_phrase": "exit"
+  },
+  "asr": {
+    "engine": "dashscope",
+    "service": "Dashscope Speech Recognition",
+    "language": "zh-CN",
+    "timeout": 10,
+    "phrase_time_limit": 30,
+    "energy_threshold": 500
+  },
+  "tts": {
+    "engine": "cosyvoice",
+    "service": "CosyVoice Speech Synthesis",
+    "voice": "zhitian_emo",
+    "speech_rate": 1.0,
+    "volume": 1.0,
+    "pitch_rate": 0
+  },
+  "llm": {
+    "provider": "bailian",
+    "service": "Qwen",
+    "model": "qwen-turbo",
+    "temperature": 0.7,
+    "system_prompt": "你是一个会说中文的语音交互助手。请提供清晰、简洁、适合语音输出的中文回答。保持回答简短但信息丰富且有帮助。"
+  }
+}
