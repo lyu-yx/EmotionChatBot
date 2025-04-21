@@ -88,6 +88,11 @@ class EmotionAwareStreamingChatbot:
         # Lock for thread safety
         self.lock = threading.Lock()
         
+        #judge whether the chatbot is activated
+        self.activated = False
+        #last activation time
+        self.last_activation = 0
+        
         print("Emotion-Aware Streaming Chatbot initialized")
     
     def listen(self) -> Dict[str, Any]:
@@ -273,7 +278,7 @@ class EmotionAwareStreamingChatbot:
             
         return False
     
-    def run_once(self, full_response: bool = False) -> Dict[str, Any]:
+    def run_once(self, full_response: bool = False, wake_word: Optional[str] = None) -> Dict[str, Any]:
         """Run one complete interaction cycle
         
         Args:
@@ -305,39 +310,46 @@ class EmotionAwareStreamingChatbot:
             
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
-                return result
+                # return result
                 
             user_input = listen_result["text"]
             result["user_input"] = user_input
-            
-            # Step 2: Process emotion
-            emotion = self.process_emotion(user_input)
-            result["user_emotion"] = emotion
-            
-            # Step 3: Process with streaming LLM and TTS
-            process_result = self.process_streaming(user_input, emotion, full_response)
-            
-            if not process_result["success"]:
-                result["error"] = process_result["error"]
-                return result
+            if not self.activated:
+                if result["user_input"] == wake_word or wake_word in result["user_input"]:
+                    self.activated = True
+                    greeting = "您好呀，我是小航！有什么可以帮到您？"
+                    self.speak(greeting)
+                else:
+                    print("等待唤醒中......")
+            else :            
+                # Step 2: Process emotion
+                emotion = self.process_emotion(user_input)
+                result["user_emotion"] = emotion
                 
-            result["response"] = process_result["response"]
-            
-            # All steps succeeded
-            result["success"] = True
-            
+                # Step 3: Process with streaming LLM and TTS
+                process_result = self.process_streaming(user_input, emotion, full_response)
+                
+                if not process_result["success"]:
+                    result["error"] = process_result["error"]
+                    return result
+                    
+                result["response"] = process_result["response"]
+                
+                # All steps succeeded
+                result["success"] = True 
         except Exception as e:
             result["error"] = f"Error during interaction: {e}"
             
         return result
     
-    def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False):
+    def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False, activation_timeout: int = 30):
         """Run the chatbot in continuous mode
         
         Args:
             wake_word: Optional wake word to start interaction (not implemented yet)
             exit_phrase: Phrase to exit the interaction
             full_response: If True, wait for the complete response before speaking
+            activation_timeout: the time activation state remaining
         """
         language_display = "Chinese" if self.recognizer.language.startswith("zh") else "English"
         print(f"Emotion-Aware Chatbot started ({language_display} mode). Say '{exit_phrase}' to exit.")
@@ -347,7 +359,7 @@ class EmotionAwareStreamingChatbot:
         
         # Initial greeting
         if language_display == "Chinese":
-            greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？"
+            greeting = "你好! 我是能够感知情绪的语音助手，您可以通过说\"{}\"来唤醒我。".format(wake_word)
         else:
             greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
@@ -360,7 +372,7 @@ class EmotionAwareStreamingChatbot:
             print("Please speak now...")
             
             # Run one interaction cycle
-            result = self.run_once(full_response)
+            result = self.run_once(full_response,wake_word)
             
             # Print recognition result for debugging
             if result["success"]:
@@ -385,7 +397,7 @@ class EmotionAwareStreamingChatbot:
                 print(f"Error: {result['error']}")
                 
                 if language_display == "Chinese":
-                    error_msg = "我遇到了一个错误。请再试一次。"
+                    error_msg = ""
                 else:
                     error_msg = "I encountered an error. Please try again."
                     
