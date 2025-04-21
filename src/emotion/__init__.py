@@ -3,4 +3,3 @@ from .emotion_detector import (
     TextBasedEmotionDetector,
     DashscopeEmotionDetector
 )
-from .identify import EmotionDetectorCamera

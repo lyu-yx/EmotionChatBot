@@ -63,31 +63,11 @@ def main():
                         help="Voice ID for TTS (e.g., loongstella, xiaomo, xiaochen)")
     parser.add_argument("--model", "-m", default="qwen-turbo",
                         help="LLM model to use (default: qwen-turbo)")
-    
-    # Emotion detection settings
-    emotion_group = parser.add_argument_group('Emotion Detection')
-    emotion_group.add_argument("--text-emotion", action="store_true", 
-                        help="Enable text-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-emotion", action="store_true",
-                        help="Enable camera-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-id", type=int, default=0,
-                        help="Camera ID to use for emotion detection (default: 0)")
-    emotion_group.add_argument("--show-camera", action="store_true",
-                        help="Show camera feed window (default: hidden)")
-    
-    # Wake word and activation settings
-    wake_group = parser.add_argument_group('Wake Word')
-    wake_group.add_argument("--wake-word", type=str, default='你好助手',
-                     help="Set a wake word to activate the chatbot (e.g., 'Hey Assistant')")
-    wake_group.add_argument("--timeout", type=int, default=60,
-                     help="Number of seconds to remain active after wake word detection (default: 60, 0 for always active)")
-    wake_group.add_argument("--debug", action="store_true",
-                     help="Enable debug mode to show detailed wake word detection information")
-    
-    # Other arguments
+    parser.add_argument("--no-emotion", default="true", type=bool,
+                        help="Disable emotion detection")
     parser.add_argument("--exit-phrase", default="exit",
                         help="Phrase to exit the chatbot (default: 'exit')")
-    parser.add_argument("--full", action="store_true", 
+    parser.add_argument("--full", default="true", type=bool, 
                         help="Use full response mode instead of streaming speech chunks")
     
     args = parser.parse_args()
@@ -130,44 +110,31 @@ def main():
     )
     
     # Choose emotion detector based on preference
-    if args.text_emotion:
-        # Use Dashscope-based emotion detector for text
-        emotion_detector = DashscopeEmotionDetector()
-        print("Text-based emotion detection enabled")
-    else:
+    if args.no_emotion:
         # Use simple text-based emotion detector when emotion detection is disabled
-        emotion_detector = None
-        print("Text-based emotion detection disabled")
+        emotion_detector = TextBasedEmotionDetector()
+        print("Emotion detection disabled, using basic keyword-based detector")
+    else:
+        # Use Dashscope-based emotion detector
+        emotion_detector = DashscopeEmotionDetector()
     
-    # Create the chatbot with appropriate camera settings
+    # Create the chatbot
     chatbot = EmotionAwareStreamingChatbot(
         recognizer=recognizer,
         tts=tts,
         llm=llm,
         emotion_detector=emotion_detector,
         system_prompt=system_prompt,
-        language=language,
-        use_text_emotion=args.text_emotion,
-        use_camera_emotion=args.camera_emotion,
-        camera_id=args.camera_id,
-        show_camera=args.show_camera
+        language=language
     )
     
     # Run the chatbot
     try:
-        chatbot.run_continuous(
-            wake_word=args.wake_word,
-            exit_phrase=args.exit_phrase, 
-            full_response=args.full,
-            activation_timeout=args.timeout
-        )
+        chatbot.run_continuous(exit_phrase=args.exit_phrase, full_response=args.full)
     except KeyboardInterrupt:
         print("\nExiting chatbot due to keyboard interrupt...")
     except Exception as e:
         print(f"Error running chatbot: {e}")
-    finally:
-        # Clean up resources
-        chatbot.cleanup()
     
     print("Chatbot session ended.")
 

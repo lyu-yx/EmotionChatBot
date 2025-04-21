@@ -14,11 +14,6 @@ from src.asr.speech_recognition_engine import SpeechRecognizer, DashscopeSpeechR
 from src.tts.speech_synthesis import TextToSpeech, StreamingTTSSynthesizer
 from src.llm.language_model import LanguageModel, StreamingLanguageModel
 from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetector, TextBasedEmotionDetector
-from src.emotion.identify import EmotionDetectorCamera
-
-# Configuration flags
-USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
-USE_CAMERA_EMOTION_DETECTION = True  # Set to True to enable camera-based emotion detection
 
 
 class EmotionAwareStreamingChatbot:
@@ -30,11 +25,7 @@ class EmotionAwareStreamingChatbot:
                  llm: Optional[LanguageModel] = None,
                  emotion_detector: Optional[EmotionDetector] = None,
                  system_prompt: Optional[str] = None,
-                 language: str = "zh-cn",
-                 use_text_emotion: bool = USE_TEXT_EMOTION_DETECTION,
-                 use_camera_emotion: bool = USE_CAMERA_EMOTION_DETECTION,
-                 camera_id: int = 0,
-                 show_camera: bool = False):
+                 language: str = "zh-cn"):
         """Initialize the emotion-aware streaming chatbot
         
         Args:
@@ -44,10 +35,6 @@ class EmotionAwareStreamingChatbot:
             emotion_detector: Emotion detection component (default: DashscopeEmotionDetector)
             system_prompt: Optional system prompt to guide the LLM
             language: Language code for ASR (default: "zh-cn")
-            use_text_emotion: Whether to use text-based emotion detection
-            use_camera_emotion: Whether to use camera-based emotion detection
-            camera_id: Camera ID to use for emotion detection
-            show_camera: Whether to show camera feed
         """
         # Default system prompt if not provided
         if system_prompt is None:
@@ -72,57 +59,13 @@ class EmotionAwareStreamingChatbot:
             system_prompt=system_prompt
         )
         
-        # Keep track of the current language
-        self.language = language
+        # Initialize emotion detector
+        self.emotion_detector = emotion_detector if emotion_detector else DashscopeEmotionDetector()
         
-        # Text-based emotion detection configuration
-        self.use_text_emotion = use_text_emotion
-        if self.use_text_emotion:
-            # Initialize emotion detector
-            self.emotion_detector = emotion_detector if emotion_detector else DashscopeEmotionDetector()
-            
-            # Fall back to text-based emotion detector if Dashscope is not available
-            if not getattr(self.emotion_detector, 'api_key', True):
-                self.emotion_detector = TextBasedEmotionDetector()
-                print("Warning: Using text-based emotion detector as fallback")
-        else:
-            # Dummy emotion detector
-            self.emotion_detector = None
-            print("Text-based emotion detection is disabled")
-        
-        # Camera-based emotion detection configuration
-        self.use_camera_emotion = use_camera_emotion
-        self.camera_detector = None
-        
-        if self.use_camera_emotion:
-            try:
-                # Check if we should use Chinese labels based on the language setting
-                use_chinese = language.startswith("zh")
-                
-                # Define callback function for camera detection
-                def on_camera_emotion_detected(result):
-                    emotion = result["emotion"]
-                    confidence = result["probability"]
-                    self.camera_emotion = emotion
-                    print(f"Camera detected emotion: {emotion} ({confidence*100:.1f}%)")
-                
-                # Initialize camera emotion detector
-                self.camera_detector = EmotionDetectorCamera(
-                    detection_interval=0.5,  # Check emotion every half second
-                    use_chinese=use_chinese,
-                    callback=on_camera_emotion_detected
-                )
-                
-                # Start the camera detection
-                success = self.camera_detector.start(camera_id=camera_id, show_video=show_camera)
-                if success:
-                    print(f"Camera-based emotion detection started (Camera ID: {camera_id})")
-                else:
-                    print("Failed to start camera-based emotion detection")
-                    self.use_camera_emotion = False
-            except Exception as e:
-                print(f"Error initializing camera emotion detection: {e}")
-                self.use_camera_emotion = False
+        # Fall back to text-based emotion detector if Dashscope is not available
+        if not getattr(self.emotion_detector, 'api_key', True):
+            self.emotion_detector = TextBasedEmotionDetector()
+            print("Warning: Using text-based emotion detector as fallback")
         
         # Conversation history for context
         self.conversation_history: List[Dict[str, str]] = []
@@ -131,8 +74,7 @@ class EmotionAwareStreamingChatbot:
         self.max_history_length = 10
         
         # User emotion state tracking
-        self.text_emotion = "neutral"
-        self.camera_emotion = "neutral"
+        self.user_emotion = "neutral"
         
         # Buffer for collecting LLM output chunks
         self.text_buffer = ""
@@ -146,36 +88,12 @@ class EmotionAwareStreamingChatbot:
         # Lock for thread safety
         self.lock = threading.Lock()
         
+        #judge whether the chatbot is activated
+        self.activated = False
+        #last activation time
+        self.last_activation = 0
+        
         print("Emotion-Aware Streaming Chatbot initialized")
-    
-    def get_current_emotion(self) -> str:
-        """Get the current emotion based on enabled detection methods
-        
-        Returns:
-            Current detected emotion
-        """
-        # If both methods are disabled, return neutral
-        if not self.use_text_emotion and not self.use_camera_emotion:
-            return "neutral"
-        
-        # If only text emotion is enabled
-        if self.use_text_emotion and not self.use_camera_emotion:
-            return self.text_emotion
-        
-        # If only camera emotion is enabled
-        if not self.use_text_emotion and self.use_camera_emotion:
-            return self.camera_emotion
-        
-        # If both are enabled, prefer camera emotion if it has high confidence
-        if self.use_camera_emotion:
-            camera_result = self.camera_detector.get_latest_emotion()
-            confidence = camera_result["probability"]
-            # Use camera emotion if confidence is high enough
-            if confidence > 0.6:
-                return self.camera_emotion
-        
-        # Fall back to text emotion or neutral
-        return self.text_emotion if self.use_text_emotion else "neutral"
     
     def listen(self) -> Dict[str, Any]:
         """Listen for user input via microphone
@@ -200,24 +118,20 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Detected dominant emotion
         """
-        # Skip emotion detection if disabled
-        if not self.use_text_emotion:
-            return "neutral"
-            
         # Detect emotion
         emotion_result = self.emotion_detector.detect_emotion_from_text(text)
         
         if emotion_result["success"]:
             # Update the user's emotional state
-            self.text_emotion = emotion_result["dominant_emotion"]
+            self.user_emotion = emotion_result["dominant_emotion"]
             
             # Log the detected emotion
-            print(f"Detected text emotion: {self.text_emotion} "
-                  f"(confidence: {emotion_result['emotions'].get(self.text_emotion, 0):.2f})")
+            print(f"Detected emotion: {self.user_emotion} "
+                  f"(confidence: {emotion_result['emotions'].get(self.user_emotion, 0):.2f})")
         else:
             print(f"Emotion detection failed: {emotion_result.get('error', 'Unknown error')}")
         
-        return self.text_emotion
+        return self.user_emotion
     
     def speak(self, text: str) -> Dict[str, Any]:
         """Convert text to speech and speak it, with protection against recording
@@ -364,7 +278,7 @@ class EmotionAwareStreamingChatbot:
             
         return False
     
-    def run_once(self, full_response: bool = False) -> Dict[str, Any]:
+    def run_once(self, full_response: bool = False, wake_word: Optional[str] = None) -> Dict[str, Any]:
         """Run one complete interaction cycle
         
         Args:
@@ -396,186 +310,74 @@ class EmotionAwareStreamingChatbot:
             
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
-                return result
+                # return result
                 
             user_input = listen_result["text"]
             result["user_input"] = user_input
-            
-            # Step 2: Process emotion from text (if enabled)
-            if self.use_text_emotion:
-                self.process_emotion(user_input)
-            
-            # Step 3: Get the current emotion (combines camera and/or text)
-            current_emotion = self.get_current_emotion()
-            result["user_emotion"] = current_emotion
-            
-            # Step 4: Process with streaming LLM and TTS
-            process_result = self.process_streaming(user_input, current_emotion, full_response)
-            
-            if not process_result["success"]:
-                result["error"] = process_result["error"]
-                return result
+            if not self.activated:
+                if result["user_input"] == wake_word or wake_word in result["user_input"]:
+                    self.activated = True
+                    greeting = "您好呀，我是小航！有什么可以帮到您？"
+                    self.speak(greeting)
+                else:
+                    print("等待唤醒中......")
+            else :            
+                # Step 2: Process emotion
+                emotion = self.process_emotion(user_input)
+                result["user_emotion"] = emotion
                 
-            result["response"] = process_result["response"]
-            
-            # All steps succeeded
-            result["success"] = True
-            
+                # Step 3: Process with streaming LLM and TTS
+                process_result = self.process_streaming(user_input, emotion, full_response)
+                
+                if not process_result["success"]:
+                    result["error"] = process_result["error"]
+                    return result
+                    
+                result["response"] = process_result["response"]
+                
+                # All steps succeeded
+                result["success"] = True 
         except Exception as e:
             result["error"] = f"Error during interaction: {e}"
             
         return result
     
-    def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False, activation_timeout: int = 60, debug_mode: bool = True):
+    def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False, activation_timeout: int = 30):
         """Run the chatbot in continuous mode
         
         Args:
-            wake_word: Optional wake word to start interaction (e.g., "Hey Siri")
+            wake_word: Optional wake word to start interaction (not implemented yet)
             exit_phrase: Phrase to exit the interaction
             full_response: If True, wait for the complete response before speaking
-            activation_timeout: Seconds to remain active after wake word detection (0 for always active)
-            debug_mode: If True, prints additional debugging information
+            activation_timeout: the time activation state remaining
         """
-        language_display = "Chinese" if self.language.startswith("zh") else "English"
-        
-        # Prepare emotion detection mode for display
-        emotion_modes = []
-        if self.use_text_emotion:
-            emotion_modes.append("Text")
-        if self.use_camera_emotion:
-            emotion_modes.append("Camera")
-        
-        emotion_mode_display = "+".join(emotion_modes) if emotion_modes else "Disabled"
-        
-        print(f"Emotion-Aware Chatbot started ({language_display} mode)")
-        print(f"Emotion detection: {emotion_mode_display}")
-        
-        # Wake word configuration
-        using_wake_word = wake_word is not None and len(wake_word.strip()) > 0
-        if using_wake_word:
-            print(f"Wake word: '{wake_word}' (Activation timeout: {activation_timeout} seconds)")
-            print(f"Debug mode: {'Enabled' if debug_mode else 'Disabled'}")
-            if self.language.startswith("zh"):
-                waiting_message = f"等待唤醒词 '{wake_word}'..."
-                activation_message = "已激活! 请说出您的问题..."
-                timeout_message = "已超时，进入休眠模式..."
-            else:
-                waiting_message = f"Waiting for wake word '{wake_word}'..."
-                activation_message = "Activated! Please speak your question..."
-                timeout_message = "Timeout, entering sleep mode..."
-        else:
-            print("Wake word: Disabled (Always active)")
-        
-        print(f"Say '{exit_phrase}' to exit.")
+        language_display = "Chinese" if self.recognizer.language.startswith("zh") else "English"
+        print(f"Emotion-Aware Chatbot started ({language_display} mode). Say '{exit_phrase}' to exit.")
         speech_mode = "full response mode" if full_response else "streaming mode"
         print(f"Speech output using {speech_mode}")
+        print("Starting initial greeting...")
         
         # Initial greeting
         if language_display == "Chinese":
-            if using_wake_word:
-                greeting = f"你好! 我是能够感知情绪的语音助手。当你需要我时，请说'{wake_word}'来唤醒我。"
-            else:
-                greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？"
+            greeting = "你好! 我是能够感知情绪的语音助手，您可以通过说\"{}\"来唤醒我。".format(wake_word)
         else:
-            if using_wake_word:
-                greeting = f"Hello! I'm an emotion-aware voice assistant. Say '{wake_word}' to wake me up when you need me."
-            else:
-                greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
+            greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
-        print("Starting initial greeting...")
         self.speak(greeting)
-        
-        # Keep track of activation state when using wake word
-        is_active = not using_wake_word  # If not using wake word, always active
-        active_until = 0  # Timestamp when activation expires
         
         running = True
         while running:
             print("\n" + "="*50)
-            
-            # Check if we need to listen for wake word
-            if using_wake_word and not is_active:
-                print(waiting_message)
-                
-                # Wait for wake word
-                wake_word_detected = False
-                while not wake_word_detected and running:
-                    try:
-                        # Listen for wake word
-                        listen_result = self.listen()
-                        
-                        if listen_result["success"]:
-                            text = listen_result["text"].lower()
-                            
-                            # Debug output - show what's being recognized
-                            if debug_mode:
-                                print(f"DEBUG - Wake word phase recognized: '{text}'")
-                                print(f"DEBUG - Looking for wake word: '{wake_word.lower()}'")
-                                print(f"DEBUG - Wake word in text: {wake_word.lower() in text}")
-                                similarity = self._calculate_text_similarity(wake_word.lower(), text)
-                                print(f"DEBUG - Text similarity score: {similarity:.2f}")
-                            
-                            # Check if user said the exit phrase
-                            if text == exit_phrase.lower() or exit_phrase.lower() in text:
-                                if language_display == "Chinese":
-                                    goodbye = "再见! 祝您有美好的一天。"
-                                else:
-                                    goodbye = "Goodbye! Have a great day."
-                                self.speak(goodbye)
-                                running = False
-                                break
-                                
-                            # Check if user said the wake word
-                            if wake_word.lower() in text:
-                                print(f"Wake word detected: '{text}'")
-                                wake_word_detected = True
-                                is_active = True
-                                active_until = time.time() + activation_timeout if activation_timeout > 0 else float('inf')
-                                print(activation_message)
-                                
-                                # Acknowledge activation with a sound or short response
-                                if language_display == "Chinese":
-                                    self.speak("我在听，请说。")
-                                else:
-                                    self.speak("I'm listening, go ahead.")
-                                    
-                                # Give user a moment to start their question
-                                time.sleep(0.5)
-                        
-                        # Brief pause between wake word detection attempts to reduce CPU usage
-                        time.sleep(0.1)
-                        
-                    except KeyboardInterrupt:
-                        print("\nExiting due to keyboard interrupt...")
-                        running = False
-                        break
-                
-                # If we're exiting the loop and not because of wake word detection, continue to next loop iteration
-                if not wake_word_detected:
-                    continue
-            
-            # If we're active, check if activation has timed out
-            if using_wake_word and is_active and activation_timeout > 0 and time.time() > active_until:
-                print(timeout_message)
-                is_active = False
-                continue
-            
-            # Regular active mode
             print("Listening for your command...")
             print("Please speak now...")
             
             # Run one interaction cycle
-            result = self.run_once(full_response)
+            result = self.run_once(full_response,wake_word)
             
             # Print recognition result for debugging
             if result["success"]:
                 print(f"\nYou said: {result['user_input']} (Emotion: {result['user_emotion']})")
                 print(f"Response: {result['response']}")
-                
-                # If using wake word, extend the activation period after each successful interaction
-                if using_wake_word and activation_timeout > 0:
-                    active_until = time.time() + activation_timeout
-                    print(f"Activation extended for {activation_timeout} seconds")
             
             # Check for exit phrase
             if result["success"] and (
@@ -595,49 +397,12 @@ class EmotionAwareStreamingChatbot:
                 print(f"Error: {result['error']}")
                 
                 if language_display == "Chinese":
-                    error_msg = "我遇到了一个错误。请再试一次。"
+                    error_msg = ""
                 else:
                     error_msg = "I encountered an error. Please try again."
                     
                 self.speak(error_msg)
             
-            # Brief pause between interactions
-            print("Pausing for a moment before next interaction...")
-            time.sleep(0.5)
-    
-    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two text strings
-        
-        Args:
-            text1: First text string
-            text2: Second text string
-            
-        Returns:
-            Similarity score between 0 and 1
-        """
-        # Simple contains check
-        if text1 in text2:
-            return 1.0
-            
-        # Check for partial matches
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        
-        if not words1 or not words2:
-            return 0.0
-            
-        # Calculate Jaccard similarity
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def cleanup(self):
-        """Clean up resources when shutting down"""
-        # Stop camera detector if it was initialized
-        if self.use_camera_emotion and self.camera_detector is not None:
-            try:
-                self.camera_detector.stop()
-                print("Camera emotion detection stopped")
-            except Exception as e:
-                print(f"Error stopping camera detection: {e}")
+            # Longer pause between interactions
+            print("Pausing for 1 second before next interaction...")
+            time.sleep(1)
