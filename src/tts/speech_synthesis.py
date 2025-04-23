@@ -9,10 +9,11 @@ import wave
 from dotenv import load_dotenv
 import dashscope
 from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
-
+import threading
+from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
-
+import queue
 
 class TextToSpeech(abc.ABC):
     """Abstract base class for text-to-speech engines"""
@@ -166,6 +167,21 @@ class StreamingTTSSynthesizer(TextToSpeech):
             "xiaobei",      # Female voice
             "aifeng"        # Female voice
         ]
+        self.interrupt = False
+        self.stop_event = threading.Event()
+        self.interrupt_word = "停"
+        self.queue = q()
+        self.is_speaking = False
+    def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
+        while not self.stop_event.is_set():
+            try:
+                if self.interrupt_word in self.queue.get(0.1)["text"]:
+                    self.interrupt = True
+                    if self.is_speaking:
+                        synthesizer.streaming_cancel()
+            except queue.Empty:
+                continue
+                
     
     def _test_ffmpeg(self):
         """Test if ffmpeg is available for audio playback"""
@@ -272,11 +288,19 @@ class StreamingTTSSynthesizer(TextToSpeech):
             except Exception as e:
                 print(f"Error initializing TTS synthesizer: {e}")
                 return self._use_fallback_tts(text)
-            
+            self.is_speaking = True
+            self.check_interrupt = threading.Thread(
+                target=self.checking_interrupt,
+                args=(synthesizer,)
+            )   
+            self.check_interrupt.daemon = True
+            self.check_interrupt.start()
             # Process text in chunks for better streaming
             max_chunk_size = 100
             chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
-            
+            # if self.interrupt:
+            #     synthesizer.streaming_cancel()
+            #     self.interrupt = True
             for chunk in chunks:
                 # Send text to TTS engine
                 try:
@@ -284,7 +308,6 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 except Exception as e:
                     print(f"Error in streaming_call: {e}")
                     continue
-            
             # Signal completion
             try:
                 synthesizer.streaming_complete()
@@ -296,11 +319,12 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 result["success"] = True
                 # Give some time for the audio to finish playing
                 time.sleep(0.5)
-            else:
+            elif self.interrupt == False:
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed
                 return self._use_fallback_tts(text)
-            
+            else:
+                result["success"] = True
         except Exception as e:
             result["error"] = f"Error during speech synthesis: {e}"
             print(f"TTS Error: {e}")
@@ -311,6 +335,9 @@ class StreamingTTSSynthesizer(TextToSpeech):
         finally:
             # Make sure to stop the player
             try:
+                self.interrupt = False
+                #self.stop_event.set()
+                self.is_speaking = False
                 if 'player' in locals() and player is not None:
                     player.stop()
             except Exception as e:

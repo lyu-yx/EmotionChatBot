@@ -8,14 +8,14 @@ from typing import Optional, List, Dict, Any
 import os
 import time
 import threading
-
 # Import our component interfaces directly from their modules
 from src.asr.speech_recognition_engine import SpeechRecognizer, DashscopeSpeechRecognizer
 from src.tts.speech_synthesis import TextToSpeech, StreamingTTSSynthesizer
 from src.llm.language_model import LanguageModel, StreamingLanguageModel
 from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetector, TextBasedEmotionDetector
 from src.emotion.identify import EmotionDetectorCamera
-
+from src.core.SharedQueue import SharedQueue as q
+from src.core.SharedLock import SharedLock as lock
 # Configuration flags
 USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
 USE_CAMERA_EMOTION_DETECTION = True  # Set to True to enable camera-based emotion detection
@@ -143,11 +143,36 @@ class EmotionAwareStreamingChatbot:
         # Flag to indicate if TTS is currently active
         self.is_speaking = False
         
+        #Flag to judge whether the bot is active
+        self.is_active = False
+        
         # Lock for thread safety
         self.lock = threading.Lock()
         
+        #Store the message
+        self.queue = q()
+        
+        #Control the listen_continuous thread
+        self.listen_all = threading.Thread(target = self.listen_continuous)
+        self.listen_all.daemon = True
+        self.listen_interrupt_stop = threading.Event()
+        
+        #Lock to avoid listen confliction
+        self.listen_lock = lock()
         print("Emotion-Aware Streaming Chatbot initialized")
-    
+    def listen_continuous(self):
+        while True:
+            with self.listen_lock:
+                if not self.listen_interrupt_stop.is_set():
+                    try :
+                        result = self.recognizer.recognize_from_microphone() 
+                        if result and result["text"] != '':
+                            if "停"in result["text"]:
+                                a=1
+                            self.queue.put(result)    
+                    except Exception as e:
+                        print(f"监听线程异常：{e}")  
+                    #print("后台监听：",self.queue.get())
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
         
@@ -228,6 +253,7 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Dict with speech result
         """
+        #TODO:1.receive the key word then stop  2.split the thread, run solely
         try:
             # Set the speaking flag to prevent listening while speaking
             with self.lock:
@@ -237,7 +263,7 @@ class EmotionAwareStreamingChatbot:
             result = self.tts.speak(text)
             
             # Add a small delay after speaking to avoid cutting off
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             return result
         finally:
@@ -392,7 +418,7 @@ class EmotionAwareStreamingChatbot:
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
-            listen_result = self.listen()
+            listen_result = self.queue.get()
             
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
@@ -482,19 +508,19 @@ class EmotionAwareStreamingChatbot:
             else:
                 greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
-        print("Starting initial greeting...")
+        print("Starting initial greeting...") 
+        self.listen_all.start()
         self.speak(greeting)
         
         # Keep track of activation state when using wake word
-        is_active = not using_wake_word  # If not using wake word, always active
+        self.is_active = not using_wake_word  # If not using wake word, always active
         active_until = 0  # Timestamp when activation expires
-        
         running = True
         while running:
             print("\n" + "="*50)
             
             # Check if we need to listen for wake word
-            if using_wake_word and not is_active:
+            if using_wake_word and not self.is_active:
                 print(waiting_message)
                 
                 # Wait for wake word
@@ -502,7 +528,7 @@ class EmotionAwareStreamingChatbot:
                 while not wake_word_detected and running:
                     try:
                         # Listen for wake word
-                        listen_result = self.listen()
+                        listen_result = self.queue.get()
                         
                         if listen_result["success"]:
                             text = listen_result["text"].lower()
@@ -529,7 +555,7 @@ class EmotionAwareStreamingChatbot:
                             if wake_word.lower() in text:
                                 print(f"Wake word detected: '{text}'")
                                 wake_word_detected = True
-                                is_active = True
+                                self.is_active = True
                                 active_until = time.time() + activation_timeout if activation_timeout > 0 else float('inf')
                                 print(activation_message)
                                 
@@ -555,9 +581,9 @@ class EmotionAwareStreamingChatbot:
                     continue
             
             # If we're active, check if activation has timed out
-            if using_wake_word and is_active and activation_timeout > 0 and time.time() > active_until:
+            if using_wake_word and self.is_active and activation_timeout > 0 and time.time() > active_until:
                 print(timeout_message)
-                is_active = False
+                self.is_active = False
                 continue
             
             # Regular active mode
@@ -592,14 +618,14 @@ class EmotionAwareStreamingChatbot:
             
             # If there was an error, report it
             elif not result["success"] and result["error"]:
-                print(f"Error: {result['error']}")
+                print("No message")
                 
-                if language_display == "Chinese":
-                    error_msg = "我遇到了一个错误。请再试一次。"
-                else:
-                    error_msg = "I encountered an error. Please try again."
+                # if language_display == "Chinese":
+                #     error_msg = "我遇到了一个错误。请再试一次。"
+                # else:
+                #     error_msg = "I encountered an error. Please try again."
                     
-                self.speak(error_msg)
+                # self.speak(error_msg)
             
             # Brief pause between interactions
             print("Pausing for a moment before next interaction...")
