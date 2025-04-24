@@ -154,8 +154,8 @@ class EmotionAwareStreamingChatbot:
         self.queue = q()
         
         #Control the listen_continuous thread
-        #self.listen_all = threading.Thread(target = self.listen_continuous)
-        #self.listen_all.daemon = True
+        self.listen_all = threading.Thread(target = self.listen_continuous)
+        self.listen_all.daemon = True
         self.listen_interrupt_stop = threading.Event()
         
         #Lock to avoid listen confliction
@@ -168,11 +168,10 @@ class EmotionAwareStreamingChatbot:
                     try :
                         result = self.recognizer.recognize_from_microphone() 
                         if result and result["text"] != '':
-                            if "停"in result["text"]:
-                                a=1
                             self.queue.put(result)    
                     except Exception as e:
                         print(f"监听线程异常：{e}")  
+            time.sleep(0.3)
                     #print("后台监听：",self.queue.get())
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
@@ -262,7 +261,7 @@ class EmotionAwareStreamingChatbot:
                 
             # Speak the text
             result = self.tts.speak(text)
-            
+            print("after speak")
             # Add a small delay after speaking to avoid cutting off
             time.sleep(0.1)
             
@@ -391,7 +390,7 @@ class EmotionAwareStreamingChatbot:
             
         return False
     
-    def run_once(self, full_response: bool = False) -> Dict[str, Any]:
+    def run_once(self, full_response: bool = False, exit_phase: str = "再见") -> Dict[str, Any]:
         """Run one complete interaction cycle
         
         Args:
@@ -405,7 +404,8 @@ class EmotionAwareStreamingChatbot:
             "response": "",
             "success": False,
             "error": None,
-            "user_emotion": "neutral"
+            "user_emotion": "neutral",
+            "exit": False
         }
         
         try:
@@ -419,12 +419,14 @@ class EmotionAwareStreamingChatbot:
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
-            listen_result = self.listen()
-            self.queue.put(listen_result)
+            print(self.queue.peek())
+            listen_result = self.queue.get()
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
                 return result
-                
+            if exit_phase in listen_result["text"]:
+                result["exit"] = True
+                return result
             user_input = listen_result["text"]
             result["user_input"] = user_input
             
@@ -516,6 +518,7 @@ class EmotionAwareStreamingChatbot:
         self.is_active = not using_wake_word  # If not using wake word, always active
         active_until = 0  # Timestamp when activation expires
         running = True
+        self.listen_all.start()
         while running:
             print("\n" + "="*50)
             
@@ -528,8 +531,7 @@ class EmotionAwareStreamingChatbot:
                 while not wake_word_detected and running:
                     try:
                         # Listen for wake word
-                        listen_result = self.listen()
-                        self.queue.put(listen_result)
+                        listen_result = self.queue.get()
                         if listen_result["success"]:
                             text = listen_result["text"].lower()
                             
@@ -591,7 +593,7 @@ class EmotionAwareStreamingChatbot:
             print("Please speak now...")
             # self.listen_all.start()
             # Run one interaction cycle
-            result = self.run_once(full_response)
+            result = self.run_once(full_response, exit_phrase)
             
             # Print recognition result for debugging
             if result["success"]:
@@ -604,10 +606,7 @@ class EmotionAwareStreamingChatbot:
                     print(f"Activation extended for {activation_timeout} seconds")
             
             # Check for exit phrase
-            if result["success"] and (
-                result["user_input"].lower() == exit_phrase.lower() or 
-                exit_phrase.lower() in result["user_input"].lower()
-            ):
+            if result["exit"] == True:
                 if language_display == "Chinese":
                     goodbye = "再见! 祝您有美好的一天。"
                 else:
