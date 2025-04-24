@@ -599,7 +599,7 @@ class EmotionAwareStreamingChatbot:
                 else:
                     error_msg = "I encountered an error. Please try again."
                     
-                self.speak(error_msg)
+                #self.speak(error_msg)
             
             # Brief pause between interactions
             print("Pausing for a moment before next interaction...")

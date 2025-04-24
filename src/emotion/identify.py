@@ -8,11 +8,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 import threading
 from typing import Dict, Any, Optional, List, Callable
-
+from PIL import ImageFont, ImageDraw, Image
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def cv2_putText_cn(img, text, position, font_path="simhei.ttf", font_size=32, color=(0, 255, 0)):
+    """
+    在 OpenCV 图像上绘制支持中文的文字（使用Pillow）。
+    
+    参数：
+        img         - OpenCV图像（numpy数组）
+        text        - 要绘制的文本（可以是中文/emoji）
+        position    - 文本起始位置 (x, y)
+        font_path   - 字体文件路径，默认使用黑体（simhei.ttf）
+        font_size   - 字体大小
+        color       - 文本颜色，(B, G, R)
 
+    返回：
+        带文字的新图像（OpenCV格式）
+    """
+    # 转换为PIL图像
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    # 加载字体（需确保字体文件存在）
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except Exception as e:
+        raise RuntimeError(f"字体加载失败，请确保字体文件路径正确：{e}")
+
+    # 绘制文字
+    draw.text(position, text, font=font, fill=color[::-1])  # RGB转BGR
+
+    # 转换回OpenCV图像
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 class Reshape(nn.Module):
     def __init__(self, *args):
         super(Reshape, self).__init__()
@@ -235,8 +264,7 @@ class EmotionDetectorCamera:
                     
                 # Draw text on frame
                 text = f"{emotion}: {prob*100:.1f}%" if prob > 0 else "Detecting..."
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                            1, (0, 255, 0), 2, cv2.LINE_AA)
+                frame = cv2_putText_cn(frame, text, (10, 30))
                 
                 # Display video
                 cv2.imshow('Emotion Detection', frame)
