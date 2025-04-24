@@ -18,3 +18,6 @@ class SharedQueue:
 
     def empty(self):
         return self.queue.empty()
+    def peek(self):
+        if self.queue.queue:
+            return self.queue.queue[-1]#注意：不加锁可能有线程安全问题

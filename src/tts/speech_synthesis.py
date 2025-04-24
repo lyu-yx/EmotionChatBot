@@ -175,10 +175,12 @@ class StreamingTTSSynthesizer(TextToSpeech):
     def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
         while not self.stop_event.is_set():
             try:
-                if self.interrupt_word in self.queue.get(0.1)["text"]:
-                    self.interrupt = True
-                    if self.is_speaking:
-                        synthesizer.streaming_cancel()
+                result = self.queue.peek()
+                if result:
+                    if self.interrupt_word in result["text"]:
+                        self.interrupt = True
+                        if self.is_speaking:
+                            synthesizer.streaming_cancel()
             except queue.Empty:
                 continue
                 

@@ -4,6 +4,7 @@ Emotion-Aware Chatbot
 Integrates ASR, LLM, TTS, and Emotion detection for a complete voice interaction experience.
 """
 
+from turtle import listen
 from typing import Optional, List, Dict, Any
 import os
 import time
@@ -153,8 +154,8 @@ class EmotionAwareStreamingChatbot:
         self.queue = q()
         
         #Control the listen_continuous thread
-        self.listen_all = threading.Thread(target = self.listen_continuous)
-        self.listen_all.daemon = True
+        #self.listen_all = threading.Thread(target = self.listen_continuous)
+        #self.listen_all.daemon = True
         self.listen_interrupt_stop = threading.Event()
         
         #Lock to avoid listen confliction
@@ -418,8 +419,8 @@ class EmotionAwareStreamingChatbot:
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
-            listen_result = self.queue.get()
-            
+            listen_result = self.listen()
+            self.queue.put(listen_result)
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
                 return result
@@ -509,7 +510,6 @@ class EmotionAwareStreamingChatbot:
                 greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
         print("Starting initial greeting...") 
-        self.listen_all.start()
         self.speak(greeting)
         
         # Keep track of activation state when using wake word
@@ -528,8 +528,8 @@ class EmotionAwareStreamingChatbot:
                 while not wake_word_detected and running:
                     try:
                         # Listen for wake word
-                        listen_result = self.queue.get()
-                        
+                        listen_result = self.listen()
+                        self.queue.put(listen_result)
                         if listen_result["success"]:
                             text = listen_result["text"].lower()
                             
@@ -589,7 +589,7 @@ class EmotionAwareStreamingChatbot:
             # Regular active mode
             print("Listening for your command...")
             print("Please speak now...")
-            
+            # self.listen_all.start()
             # Run one interaction cycle
             result = self.run_once(full_response)
             
