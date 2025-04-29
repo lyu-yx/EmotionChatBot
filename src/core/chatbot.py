@@ -171,7 +171,7 @@ class EmotionAwareStreamingChatbot:
                             self.queue.put(result)    
                     except Exception as e:
                         print(f"监听线程异常：{e}")  
-            time.sleep(0.3)
+            #time.sleep(0.1)
                     #print("后台监听：",self.queue.get())
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
@@ -263,7 +263,7 @@ class EmotionAwareStreamingChatbot:
             result = self.tts.speak(text)
             print("after speak")
             # Add a small delay after speaking to avoid cutting off
-            time.sleep(0.1)
+            #time.sleep(0.1)
             
             return result
         finally:
@@ -282,6 +282,7 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Dict with response generation results
         """
+        start = time.time()
         result = {
             "user_input": user_input,
             "response": "",
@@ -419,7 +420,6 @@ class EmotionAwareStreamingChatbot:
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
-            print(self.queue.peek())
             listen_result = self.queue.get()
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
@@ -437,7 +437,6 @@ class EmotionAwareStreamingChatbot:
             # Step 3: Get the current emotion (combines camera and/or text)
             current_emotion = self.get_current_emotion()
             result["user_emotion"] = current_emotion
-            
             # Step 4: Process with streaming LLM and TTS
             process_result = self.process_streaming(user_input, current_emotion, full_response)
             

@@ -170,7 +170,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
         self.interrupt = False
         self.thread_stop_event = threading.Event()
         self.interrupt_event = threading.Event()
-        self.interrupt_word = "停"
+        self.interrupt_word = "你好"
         self.queue = q()
         self.is_speaking = False
     def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
@@ -184,12 +184,12 @@ class StreamingTTSSynthesizer(TextToSpeech):
                         if getattr(synthesizer, "_is_started", False):
                             try:
                                 synthesizer.streaming_cancel()
-                                self.queue.get()
+                                self.queue.clear()
                             except Exception as e:
                                 print(f"Cancel failed: {e}")
             except queue.Empty:
                 continue
-            time.sleep(0.3)
+            time.sleep(0.1)
                 
     
     def _test_ffmpeg(self):
