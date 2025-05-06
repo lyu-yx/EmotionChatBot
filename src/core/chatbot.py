@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 import os
 import time
 import threading
+import queue
 # Import our component interfaces directly from their modules
 from src.asr.speech_recognition_engine import SpeechRecognizer, DashscopeSpeechRecognizer
 from src.tts.speech_synthesis import TextToSpeech, StreamingTTSSynthesizer
@@ -144,35 +145,281 @@ class EmotionAwareStreamingChatbot:
         # Flag to indicate if TTS is currently active
         self.is_speaking = False
         
-        #Flag to judge whether the bot is active
+        # Flag to judge whether the bot is active
         self.is_active = False
         
         # Lock for thread safety
         self.lock = threading.Lock()
         
-        #Store the message
+        # Store the message
         self.queue = q()
         
-        #Control the listen_continuous thread
-        self.listen_all = threading.Thread(target = self.listen_continuous)
+        # Response cache for common phrases
+        self.response_cache = {}
+        
+        # Barge-in control flags
+        self.speech_should_stop = threading.Event()
+        
+        # Parallel processing threads and queues
+        self.asr_queue = queue.Queue()  # For speech recognition results
+        self.llm_queue = queue.Queue()  # For LLM processing results
+        self.tts_queue = queue.Queue()  # For TTS processing
+        
+        # Control the listen_continuous thread
+        self.listen_all = threading.Thread(target=self.listen_continuous)
         self.listen_all.daemon = True
         self.listen_interrupt_stop = threading.Event()
         
-        #Lock to avoid listen confliction
+        # Processing thread for LLM
+        self.llm_thread = threading.Thread(target=self.llm_process_continuous)
+        self.llm_thread.daemon = True
+        
+        # Processing thread for TTS
+        self.tts_thread = threading.Thread(target=self.tts_process_continuous)
+        self.tts_thread.daemon = True
+        
+        # Lock to avoid listen confliction
         self.listen_lock = lock()
+        
+        # Warmup the models by initializing with empty calls
+        self._warmup_models()
+        
         print("Emotion-Aware Streaming Chatbot initialized")
+    
+    def _warmup_models(self):
+        """Warm up models with dummy requests to reduce initial latency"""
+        try:
+            # Warm up LLM with a simple request
+            self.llm.generate_response("Hello", [])
+            
+            # Warm up TTS with a simple request (without actually playing)
+            self.tts.prepare_synthesis("Hello")
+            
+            print("Models warmed up to reduce initial latency")
+        except Exception as e:
+            print(f"Model warmup failed (this is not critical): {e}")
+            
     def listen_continuous(self):
+        """Continuously listen for user input in a background thread"""
         while True:
             with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
-                    try :
-                        result = self.recognizer.recognize_from_microphone() 
+                    try:
+                        # Check if speech is ongoing and should be interrupted
+                        if self.is_speaking:
+                            # Check audio level to see if user is speaking
+                            # If audio level is above threshold, interrupt current speech
+                            audio_level = self._get_audio_level()
+                            if audio_level > 1000:  # Adjust threshold as needed
+                                print("User started speaking - interrupting current speech")
+                                self.speech_should_stop.set()
+                                with self.lock:
+                                    self.is_speaking = False
+                        
+                        # Recognize speech
+                        result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
-                            self.queue.put(result)    
+                            # Interrupt current speech when new input is detected
+                            if self.is_speaking:
+                                print("New speech detected - interrupting current output")
+                                self.speech_should_stop.set()
+                                with self.lock:
+                                    self.is_speaking = False
+                            
+                            self.queue.put(result)
+                            # Also put in ASR queue for parallel processing
+                            self.asr_queue.put(result)
                     except Exception as e:
-                        print(f"监听线程异常：{e}")  
-            #time.sleep(0.1)
-                    #print("后台监听：",self.queue.get())
+                        print(f"Listen thread exception: {e}")
+            time.sleep(0.05)  # Small sleep to prevent CPU overuse
+    
+    def _get_audio_level(self):
+        """Get current audio input level for barge-in detection"""
+        try:
+            import pyaudio
+            import numpy as np
+            
+            # Use a short window to check audio level
+            CHUNK = 1024
+            FORMAT = pyaudio.paInt16
+            CHANNELS = 1
+            RATE = 16000
+            
+            p = pyaudio.PyAudio()
+            stream = p.open(format=FORMAT,
+                            channels=CHANNELS,
+                            rate=RATE,
+                            input=True,
+                            frames_per_buffer=CHUNK)
+            
+            # Read a small sample to check level
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            
+            # Calculate RMS as a measure of audio level
+            rms = np.sqrt(np.mean(np.square(audio_data)))
+            
+            # Clean up
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            
+            return rms
+        except Exception as e:
+            # Fall back to a default value if audio level detection fails
+            print(f"Audio level detection failed: {e}")
+            return 0
+            
+    def llm_process_continuous(self):
+        """Process LLM requests in a separate thread"""
+        while True:
+            try:
+                # Get the next speech recognition result
+                asr_result = self.asr_queue.get(timeout=0.5)
+                
+                # Skip empty results
+                if not asr_result or not asr_result.get("text"):
+                    continue
+                
+                user_input = asr_result["text"]
+                
+                # Check cache first for common responses
+                if user_input in self.response_cache:
+                    cached_response = self.response_cache[user_input]
+                    print(f"Using cached response for: {user_input}")
+                    self.llm_queue.put({
+                        "input": user_input,
+                        "response": cached_response,
+                        "success": True,
+                        "from_cache": True
+                    })
+                    continue
+                
+                # Process emotion from text if enabled
+                if self.use_text_emotion:
+                    self.process_emotion(user_input)
+                
+                # Get current emotion
+                current_emotion = self.get_current_emotion()
+                
+                # Add emotion context to the user input
+                emotion_context = f"[User emotion: {current_emotion}] "
+                augmented_input = emotion_context + user_input
+                
+                # Start processing with LLM
+                print(f"LLM thread processing: '{user_input}' (Emotion: {current_emotion})")
+                
+                llm_result = self.llm.generate_response(
+                    user_input=augmented_input,
+                    conversation_history=self.conversation_history
+                )
+                
+                # Put the result in the queue for TTS processing
+                if llm_result["success"]:
+                    # Cache frequently used responses (only if they're short enough)
+                    if len(user_input) < 20 and len(llm_result["response"]) < 100:
+                        self.response_cache[user_input] = llm_result["response"]
+                    
+                    # Update conversation history
+                    self.conversation_history.append({"role": "user", "content": user_input})
+                    self.conversation_history.append({"role": "assistant", "content": llm_result["response"]})
+                    
+                    # Trim history if it exceeds maximum length
+                    if len(self.conversation_history) > self.max_history_length * 2:
+                        self.conversation_history = self.conversation_history[-self.max_history_length*2:]
+                
+                self.llm_queue.put({
+                    "input": user_input,
+                    "response": llm_result["response"],
+                    "success": llm_result["success"],
+                    "error": llm_result.get("error"),
+                    "emotion": current_emotion,
+                    "from_cache": False
+                })
+                
+            except queue.Empty:
+                # Queue timeout, continue waiting
+                pass
+            except Exception as e:
+                print(f"LLM thread exception: {e}")
+                
+            time.sleep(0.05)  # Small sleep to prevent CPU overuse
+    
+    def tts_process_continuous(self):
+        """Process TTS requests in a separate thread"""
+        while True:
+            try:
+                # Get the next LLM result
+                llm_result = self.llm_queue.get(timeout=0.5)
+                
+                # Skip failed results
+                if not llm_result["success"]:
+                    print(f"Skipping TTS for failed LLM result: {llm_result.get('error')}")
+                    continue
+                
+                response_text = llm_result["response"]
+                
+                # Split into sentences for faster response
+                sentences = self._split_into_sentences(response_text)
+                
+                # Process each sentence
+                for i, sentence in enumerate(sentences):
+                    # Check if we should stop speaking
+                    if self.speech_should_stop.is_set():
+                        print("TTS interrupted - stopping speech")
+                        self.speech_should_stop.clear()
+                        break
+                    
+                    print(f"TTS processing sentence {i+1}/{len(sentences)}")
+                    
+                    # Set speaking flag
+                    with self.lock:
+                        self.is_speaking = True
+                    
+                    # Speak the sentence
+                    try:
+                        self.tts.speak(sentence)
+                    except Exception as e:
+                        print(f"TTS exception: {e}")
+                    
+                    # Clear speaking flag after each sentence
+                    with self.lock:
+                        self.is_speaking = False
+                    
+                    # Small pause between sentences for natural speech rhythm
+                    time.sleep(0.1)
+                
+            except queue.Empty:
+                # Queue timeout, continue waiting
+                pass
+            except Exception as e:
+                print(f"TTS thread exception: {e}")
+                # Make sure to reset speaking flag on error
+                with self.lock:
+                    self.is_speaking = False
+                    
+            time.sleep(0.05)  # Small sleep to prevent CPU overuse
+    
+    def _split_into_sentences(self, text):
+        """Split text into sentences for better streaming"""
+        sentences = []
+        current = ""
+        
+        # Process character by character
+        for char in text:
+            current += char
+            
+            # Check if we've reached a sentence boundary
+            if char in self.sentence_end_chars:
+                sentences.append(current)
+                current = ""
+        
+        # Add any remaining text
+        if current:
+            sentences.append(current)
+            
+        return sentences
+    
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
         
@@ -518,6 +765,8 @@ class EmotionAwareStreamingChatbot:
         active_until = 0  # Timestamp when activation expires
         running = True
         self.listen_all.start()
+        self.llm_thread.start()
+        self.tts_thread.start()
         while running:
             print("\n" + "="*50)
             
