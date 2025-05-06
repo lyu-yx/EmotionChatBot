@@ -212,7 +212,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             silence_start = None
             silence_duration = 0
             silence_threshold = 200  # Adjusted silence detection (higher = less sensitive)
-            silence_time_to_stop = 3  # Silence duration required to stop recording (reduced from 5s to 2s)
+            silence_time_to_stop = 1  # Silence duration required to stop recording (reduced from 5s to 2s)
             
             try:
                 # Continue until timeout or silence detected

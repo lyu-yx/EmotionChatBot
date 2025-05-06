@@ -9,10 +9,11 @@ import wave
 from dotenv import load_dotenv
 import dashscope
 from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
-
+import threading
+from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
-
+import queue
 
 class TextToSpeech(abc.ABC):
     """Abstract base class for text-to-speech engines"""
@@ -166,6 +167,30 @@ class StreamingTTSSynthesizer(TextToSpeech):
             "xiaobei",      # Female voice
             "aifeng"        # Female voice
         ]
+        self.interrupt = False
+        self.thread_stop_event = threading.Event()
+        self.interrupt_event = threading.Event()
+        self.interrupt_word = "你好"
+        self.queue = q()
+        self.is_speaking = False
+    def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
+        while not self.thread_stop_event.is_set():
+            try:
+                result = self.queue.peek()
+                if result:
+                    if self.interrupt_word in result["text"]:
+                        self.interrupt = True
+                        self.interrupt_event.set()
+                        if getattr(synthesizer, "_is_started", False):
+                            try:
+                                synthesizer.streaming_cancel()
+                                self.queue.clear()
+                            except Exception as e:
+                                print(f"Cancel failed: {e}")
+            except queue.Empty:
+                continue
+            time.sleep(0.1)
+                
     
     def _test_ffmpeg(self):
         """Test if ffmpeg is available for audio playback"""
@@ -206,7 +231,8 @@ class StreamingTTSSynthesizer(TextToSpeech):
             "success": False,
             "error": None
         }
-        
+        self.thread_stop_event.clear()
+        self.interrupt_event.clear()
         if not text or text.isspace():
             result["error"] = "Empty text provided"
             return result
@@ -258,7 +284,6 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 def on_data(self, data: bytes) -> None:
                     self.had_data = True
                     player.write(data)
-            
             # Initialize callback
             callback = TTSCallback()
             
@@ -272,19 +297,26 @@ class StreamingTTSSynthesizer(TextToSpeech):
             except Exception as e:
                 print(f"Error initializing TTS synthesizer: {e}")
                 return self._use_fallback_tts(text)
-            
+            self.check_interrupt = threading.Thread(
+                target=self.checking_interrupt,
+                args=(synthesizer,)
+            )   
+            self.check_interrupt.daemon = True
+            self.check_interrupt.start()
             # Process text in chunks for better streaming
             max_chunk_size = 100
             chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
-            
+            # if self.interrupt:
+            #     synthesizer.streaming_cancel()
+            #     self.interrupt = True
             for chunk in chunks:
                 # Send text to TTS engine
                 try:
                     synthesizer.streaming_call(chunk)
+                    self.is_speaking = True
                 except Exception as e:
                     print(f"Error in streaming_call: {e}")
                     continue
-            
             # Signal completion
             try:
                 synthesizer.streaming_complete()
@@ -296,11 +328,12 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 result["success"] = True
                 # Give some time for the audio to finish playing
                 time.sleep(0.5)
-            else:
+            elif self.interrupt == False:
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed
                 return self._use_fallback_tts(text)
-            
+            else:
+                result["success"] = True
         except Exception as e:
             result["error"] = f"Error during speech synthesis: {e}"
             print(f"TTS Error: {e}")
@@ -311,6 +344,9 @@ class StreamingTTSSynthesizer(TextToSpeech):
         finally:
             # Make sure to stop the player
             try:
+                self.interrupt = False
+                #self.thread_stop_event.set()
+                self.is_speaking = False
                 if 'player' in locals() and player is not None:
                     player.stop()
             except Exception as e:
