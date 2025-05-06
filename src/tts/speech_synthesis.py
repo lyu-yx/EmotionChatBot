@@ -14,7 +14,9 @@ from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
 import queue
-
+import logging
+from datetime import datetime
+logging.basicConfig(level=logging.INFO)
 class TextToSpeech(abc.ABC):
     """Abstract base class for text-to-speech engines"""
 
@@ -170,7 +172,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
         self.interrupt = False
         self.thread_stop_event = threading.Event()
         self.interrupt_event = threading.Event()
-        self.interrupt_word = "你好"
+        self.interrupt_word = "你好助手"
         self.queue = q()
         self.is_speaking = False
     def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
@@ -318,6 +320,8 @@ class StreamingTTSSynthesizer(TextToSpeech):
                     print(f"Error in streaming_call: {e}")
                     continue
             # Signal completion
+            timestamp = datetime.now().timestamp()
+            logging.info(f"time before speaking:{timestamp}")
             try:
                 synthesizer.streaming_complete()
             except Exception as e:
@@ -327,7 +331,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
             if callback.had_data:
                 result["success"] = True
                 # Give some time for the audio to finish playing
-                time.sleep(0.5)
+                time.sleep(0.25)
             elif self.interrupt == False:
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed

@@ -7,8 +7,9 @@ import time
 import threading
 import pyaudio
 import numpy as np
-
-
+from datetime import datetime
+import logging
+logging.basicConfig(level=logging.INFO)
 class SpeechRecognizer(abc.ABC):
     """Abstract base class for speech recognition engines"""
     
@@ -212,7 +213,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             silence_start = None
             silence_duration = 0
             silence_threshold = 200  # Adjusted silence detection (higher = less sensitive)
-            silence_time_to_stop = 1  # Silence duration required to stop recording (reduced from 5s to 2s)
+            silence_time_to_stop = 0.5  # Silence duration required to stop recording (reduced from 5s to 2s)
             
             try:
                 # Continue until timeout or silence detected
@@ -252,8 +253,9 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             recognition.stop()
             
             # Wait a brief moment for final processing
-            time.sleep(0.5)
-            
+            time.sleep(0.25)
+            timestamp = datetime.now().timestamp()
+            logging.info(f"after recognition:{timestamp}")
             # Use the final text if available, otherwise use current sentence
             recognized_text = final_text if final_text else current_sentence
             
