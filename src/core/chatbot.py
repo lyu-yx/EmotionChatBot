@@ -18,6 +18,9 @@ from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetect
 from src.emotion.identify import EmotionDetectorCamera
 from src.core.SharedQueue import SharedQueue as q
 from src.core.SharedLock import SharedLock as lock
+from datetime import datetime
+import logging
+logging.basicConfig(level=logging.INFO)
 # Configuration flags
 USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
 USE_CAMERA_EMOTION_DETECTION = True  # Set to True to enable camera-based emotion detection
@@ -500,7 +503,6 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Dict with speech result
         """
-        #TODO:1.receive the key word then stop  2.split the thread, run solely
         try:
             # Set the speaking flag to prevent listening while speaking
             with self.lock:
@@ -663,11 +665,13 @@ class EmotionAwareStreamingChatbot:
                     if not self.is_speaking:
                         break
                 print("Waiting for speech to complete before listening...")
-                time.sleep(0.5)
+                time.sleep(0.25)
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
             listen_result = self.queue.get()
+            timestamp = datetime.now().timestamp()
+            logging.info(f"after queue get:{timestamp}")
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
                 return result
@@ -816,7 +820,7 @@ class EmotionAwareStreamingChatbot:
                                     self.speak("I'm listening, go ahead.")
                                     
                                 # Give user a moment to start their question
-                                time.sleep(0.5)
+                                time.sleep(0.25)
                         
                         # Brief pause between wake word detection attempts to reduce CPU usage
                         time.sleep(0.1)
@@ -876,7 +880,7 @@ class EmotionAwareStreamingChatbot:
             
             # Brief pause between interactions
             print("Pausing for a moment before next interaction...")
-            time.sleep(0.5)
+            time.sleep(0.25)
     
     def _calculate_text_similarity(self, text1: str, text2: str) -> float:
         """Calculate similarity between two text strings
