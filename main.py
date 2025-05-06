@@ -68,7 +68,7 @@ def main():
     emotion_group = parser.add_argument_group('Emotion Detection')
     emotion_group.add_argument("--text-emotion", default=False, 
                         help="Enable text-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-emotion", default=True,
+    emotion_group.add_argument("--camera-emotion", default=False,
                         help="Enable camera-based emotion detection (default: disabled)")
     emotion_group.add_argument("--camera-id", type=int, default=0,
                         help="Camera ID to use for emotion detection (default: 0)")
@@ -77,7 +77,7 @@ def main():
     
     # Wake word and activation settings
     wake_group = parser.add_argument_group('Wake Word')
-    wake_group.add_argument("--wake-word", type=str, default='你好',
+    wake_group.add_argument("--wake-word", type=str, default='你好助手',
                      help="Set a wake word to activate the chatbot (e.g., 'Hey Assistant')")
     wake_group.add_argument("--timeout", type=int, default=60,
                      help="Number of seconds to remain active after wake word detection (default: 60, 0 for always active)")
