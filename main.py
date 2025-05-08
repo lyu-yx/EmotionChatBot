@@ -68,7 +68,7 @@ def main():
     emotion_group = parser.add_argument_group('Emotion Detection')
     emotion_group.add_argument("--text-emotion", default=False, 
                         help="Enable text-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-emotion", default=False,
+    emotion_group.add_argument("--camera-emotion", default=True,
                         help="Enable camera-based emotion detection (default: disabled)")
     emotion_group.add_argument("--camera-id", type=int, default=0,
                         help="Camera ID to use for emotion detection (default: 0)")
@@ -140,7 +140,7 @@ def main():
         print("Text-based emotion detection disabled")
     
     # Create the chatbot with appropriate camera settings
-    chatbot = EmotionAwareStreamingChatbot(
+    chatbot = EmotionAwareStreamingChatbot(  #TODO:1.streaming response to reduce waiting time 2.merge lgz branch 3.continue listen 
         recognizer=recognizer,
         tts=tts,
         llm=llm,

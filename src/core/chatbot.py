@@ -20,6 +20,7 @@ from src.core.SharedQueue import SharedQueue as q
 from src.core.SharedLock import SharedLock as lock
 from datetime import datetime
 import logging
+import random
 logging.basicConfig(level=logging.INFO)
 # Configuration flags
 USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
@@ -212,12 +213,12 @@ class EmotionAwareStreamingChatbot:
         self.listen_lock = lock()
         
         # Try to warm up the models with simple queries
-        try:
-            # Warm up LLM with a simple request
-            self.llm.generate_response("Hello", [])
-            print("LLM model warmed up")
-        except Exception as e:
-            print(f"LLM warmup failed (not critical): {e}")
+        # try:
+        #     # Warm up LLM with a simple request
+        #     self.llm.generate_response("Hello", [])
+        #     print("LLM model warmed up")
+        # except Exception as e:
+        #     print(f"LLM warmup failed (not critical): {e}")
             
         # Dynamic threshold adjustment
         self.dynamic_threshold_enabled = True
@@ -231,26 +232,26 @@ class EmotionAwareStreamingChatbot:
             with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
                     try:
-                        # Check if speech is ongoing and should be interrupted
-                        if self.is_speaking:
-                            # Check audio level to see if user is speaking
-                            # If audio level is above threshold, interrupt current speech
-                            audio_level = self._get_audio_level()
-                            if (audio_level > 1000):  # Adjust threshold as needed
-                                print("User started speaking - interrupting current speech")
-                                self.speech_should_stop.set()
-                                with self.lock:
-                                    self.is_speaking = False
+                        # # Check if speech is ongoing and should be interrupted
+                        # if self.is_speaking:
+                        #     # Check audio level to see if user is speaking
+                        #     # If audio level is above threshold, interrupt current speech
+                        #     audio_level = self._get_audio_level()
+                        #     if (audio_level > 0.5):  # Adjust threshold as needed
+                        #         print("User started speaking - interrupting current speech")
+                        #         self.speech_should_stop.set()
+                        #         with self.lock:
+                        #             self.is_speaking = False
                         
                         # Recognize speech
                         result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
-                            # Interrupt current speech when new input is detected
-                            if self.is_speaking:
-                                print("New speech detected - interrupting current output")
-                                self.speech_should_stop.set()
-                                with self.lock:
-                                    self.is_speaking = False
+                            # # Interrupt current speech when new input is detected
+                            # if self.is_speaking:
+                            #     print("New speech detected - interrupting current output")
+                            #     self.speech_should_stop.set()
+                            #     with self.lock:
+                            #         self.is_speaking = False
                             
                             self.queue.put(result)
                             # Also put in ASR queue for parallel processing
@@ -357,10 +358,11 @@ class EmotionAwareStreamingChatbot:
                 if not cache_hit:
                     # Process emotion from text if enabled
                     if self.use_text_emotion:
-                        self.process_emotion(user_input)
+                        current_emotion = self.process_emotion(user_input)
                     
                     # Get current emotion
-                    current_emotion = self.get_current_emotion()
+                    if self.use_camera_emotion:
+                        current_emotion = self.get_current_emotion()
                     
                     # Add emotion context to the user input
                     emotion_context = f"[User emotion: {current_emotion}] "
@@ -441,7 +443,7 @@ class EmotionAwareStreamingChatbot:
                 if not llm_result["success"]:
                     print(f"Skipping TTS for failed LLM result: {llm_result.get('error')}")
                     continue
-                
+                print("Success get llm result")
                 response_text = llm_result["response"]
                 from_cache = llm_result.get("from_cache", False)
                 
@@ -460,10 +462,10 @@ class EmotionAwareStreamingChatbot:
                 # Process each sentence with interruption handling
                 for i, sentence in enumerate(sentences):
                     # Check if we should stop speaking before starting next sentence
-                    if self.speech_should_stop.is_set():
-                        print("TTS interrupted - stopping speech")
-                        self.speech_should_stop.clear()
-                        break
+                    # if self.speech_should_stop.is_set():
+                    #     print("TTS interrupted - stopping speech")
+                    #     self.speech_should_stop.clear()
+                    #     break
                     
                     # Set speaking flag
                     with self.lock:
@@ -892,8 +894,8 @@ class EmotionAwareStreamingChatbot:
         # Start all background threads
         print("Starting background threads...")
         self.listen_thread.start()
-        self.llm_thread.start()
-        self.tts_thread.start()
+        # self.llm_thread.start()
+        # self.tts_thread.start()
         
         # Periodically recalibrate audio baseline
         last_calibration = time.time()

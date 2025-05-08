@@ -192,6 +192,14 @@ class StreamingTTSSynthesizer(TextToSpeech):
                             try:
                                 synthesizer.streaming_cancel()
                                 self.queue.clear()
+                                try:
+                                    self.interrupt = False
+                                    self.thread_stop_event.set()
+                                    self.is_speaking = False
+                                except Exception as e:
+                                    print(f"Error stopping player: {e}")
+                                time.sleep(0.2)
+                                self.speak("我在")
                             except Exception as e:
                                 print(f"Cancel failed: {e}")
             except queue.Empty:
@@ -354,8 +362,9 @@ class StreamingTTSSynthesizer(TextToSpeech):
             # Make sure to stop the player
             try:
                 self.interrupt = False
-                #self.thread_stop_event.set()
+                self.thread_stop_event.set()
                 self.is_speaking = False
+                self.queue.clear()
                 if 'player' in locals() and player is not None:
                     player.stop()
             except Exception as e:

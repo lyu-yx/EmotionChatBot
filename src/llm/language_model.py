@@ -121,7 +121,7 @@ class StreamingLanguageModel(LanguageModel):
             
             # Extract the response text
             if response.status_code == 200:
-                result["response"] = response.output.choices[0].message.content
+                result["response"] = response.output.text
                 result["success"] = True
             else:
                 result["error"] = f"API Error: {response.code} - {response.message}"
