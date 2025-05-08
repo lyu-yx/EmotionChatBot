@@ -10,7 +10,7 @@ import pyaudio
 import os
 import shutil
 import sys
-
+from src.core.SharedLock import SharedLock as lock 
 
 class RealtimeMp3Player:
     """Player for streaming MP3 audio in real-time using ffmpeg and pyaudio"""
@@ -34,7 +34,7 @@ class RealtimeMp3Player:
         #     print(f"Found ffmpeg in PATH: {self.ffmpeg_path}")
         # else:
         #     print("Warning: ffmpeg not found in PATH. Audio playback may not work.")
-
+        self.listen_lock = lock()
     def _find_ffmpeg(self):
         """Find the ffmpeg binary in the system PATH"""
         ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
@@ -49,7 +49,8 @@ class RealtimeMp3Player:
             common_paths = [
                 "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
                 "C:\\ffmpeg\\bin\\ffmpeg.exe",
-                "E:\\ffmpeg\\bin\\ffmpeg.exe"
+                "E:\\ffmpeg\\bin\\ffmpeg.exe",
+                "D:\\Apps\\ffmpeg\\bin\\ffmpeg.exe"
             ]
             
             for path in common_paths:
@@ -71,8 +72,10 @@ class RealtimeMp3Player:
         if not self.ffmpeg_path:
             print("Error: Cannot start player without ffmpeg")
             return False
-            
-        self._player = pyaudio.PyAudio()  # initialize pyaudio to play audio
+        print("before pyaudio")  
+        with self.listen_lock:
+            self._player = pyaudio.PyAudio()  # initialize pyaudio to play audio
+        print("after pyaudio")
         self._stream = self._player.open(
             format=pyaudio.paInt16, channels=1, rate=22050,
             output=True)  # initialize pyaudio stream

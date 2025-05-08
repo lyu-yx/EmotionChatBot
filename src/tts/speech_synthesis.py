@@ -9,11 +9,14 @@ import wave
 from dotenv import load_dotenv
 import dashscope
 from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
-
+import threading
+from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
-
-
+import queue
+import logging
+from datetime import datetime
+logging.basicConfig(level=logging.INFO)
 class TextToSpeech(abc.ABC):
     """Abstract base class for text-to-speech engines"""
 
@@ -166,6 +169,35 @@ class StreamingTTSSynthesizer(TextToSpeech):
             "xiaobei",      # Female voice
             "aifeng"        # Female voice
         ]
+        self.interrupt = False
+        self.thread_stop_event = threading.Event()
+        self.interrupt_event = threading.Event()
+        self.interrupt_word = "你好助手"
+        self.queue = q()
+        self.is_speaking = False
+        
+        # For prepare_synthesis feature
+        self.prepared_text = None
+        self.prepared_data = None
+        
+    def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
+        while not self.thread_stop_event.is_set():
+            try:
+                result = self.queue.peek()
+                if result:
+                    if self.interrupt_word in result["text"]:
+                        self.interrupt = True
+                        self.interrupt_event.set()
+                        if getattr(synthesizer, "_is_started", False):
+                            try:
+                                synthesizer.streaming_cancel()
+                                self.queue.clear()
+                            except Exception as e:
+                                print(f"Cancel failed: {e}")
+            except queue.Empty:
+                continue
+            time.sleep(0.1)
+                
     
     def _test_ffmpeg(self):
         """Test if ffmpeg is available for audio playback"""
@@ -206,7 +238,8 @@ class StreamingTTSSynthesizer(TextToSpeech):
             "success": False,
             "error": None
         }
-        
+        self.thread_stop_event.clear()
+        self.interrupt_event.clear()
         if not text or text.isspace():
             result["error"] = "Empty text provided"
             return result
@@ -258,7 +291,6 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 def on_data(self, data: bytes) -> None:
                     self.had_data = True
                     player.write(data)
-            
             # Initialize callback
             callback = TTSCallback()
             
@@ -272,20 +304,29 @@ class StreamingTTSSynthesizer(TextToSpeech):
             except Exception as e:
                 print(f"Error initializing TTS synthesizer: {e}")
                 return self._use_fallback_tts(text)
-            
+            self.check_interrupt = threading.Thread(
+                target=self.checking_interrupt,
+                args=(synthesizer,)
+            )   
+            self.check_interrupt.daemon = True
+            self.check_interrupt.start()
             # Process text in chunks for better streaming
             max_chunk_size = 100
             chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
-            
+            # if self.interrupt:
+            #     synthesizer.streaming_cancel()
+            #     self.interrupt = True
             for chunk in chunks:
                 # Send text to TTS engine
                 try:
                     synthesizer.streaming_call(chunk)
+                    self.is_speaking = True
                 except Exception as e:
                     print(f"Error in streaming_call: {e}")
                     continue
-            
             # Signal completion
+            timestamp = datetime.now().timestamp()
+            logging.info(f"time before speaking:{timestamp}")
             try:
                 synthesizer.streaming_complete()
             except Exception as e:
@@ -295,12 +336,13 @@ class StreamingTTSSynthesizer(TextToSpeech):
             if callback.had_data:
                 result["success"] = True
                 # Give some time for the audio to finish playing
-                time.sleep(0.5)
-            else:
+                time.sleep(0.25)
+            elif self.interrupt == False:
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed
                 return self._use_fallback_tts(text)
-            
+            else:
+                result["success"] = True
         except Exception as e:
             result["error"] = f"Error during speech synthesis: {e}"
             print(f"TTS Error: {e}")
@@ -311,6 +353,9 @@ class StreamingTTSSynthesizer(TextToSpeech):
         finally:
             # Make sure to stop the player
             try:
+                self.interrupt = False
+                #self.thread_stop_event.set()
+                self.is_speaking = False
                 if 'player' in locals() and player is not None:
                     player.stop()
             except Exception as e:
@@ -406,3 +451,165 @@ class StreamingTTSSynthesizer(TextToSpeech):
         except Exception as e:
             print(f"Error playing WAV file: {e}")
             return False
+
+    def prepare_synthesis(self, text: str) -> bool:
+        """Prepare text for synthesis without playing it
+        
+        Args:
+            text: The text to prepare for speech
+            
+        Returns:
+            Boolean indicating success
+        """
+        if not text or text.isspace():
+            print("Empty text provided for preparation")
+            return False
+            
+        # Store the text for later use
+        self.prepared_text = text
+        
+        # If no API key is available, just store the text for later fallback
+        if not self.api_key:
+            return True
+            
+        try:
+            # Create a simple buffer to store the prepared audio data
+            class DataCollector(ResultCallback):
+                def __init__(self):
+                    self.data_chunks = []
+                    self.had_data = False
+                    self.error_msg = None
+                
+                def on_open(self):
+                    pass
+                
+                def on_complete(self):
+                    pass
+                
+                def on_error(self, message: str):
+                    self.error_msg = f"TTS synthesis preparation failed: {message}"
+                    print(self.error_msg)
+                
+                def on_close(self):
+                    pass
+                
+                def on_event(self, message):
+                    pass
+                
+                def on_data(self, data: bytes) -> None:
+                    self.had_data = True
+                    self.data_chunks.append(data)
+            
+            # Initialize the collector
+            collector = DataCollector()
+            
+            # Initialize TTS synthesizer for preparation
+            try:
+                synthesizer = SpeechSynthesizer(
+                    model=self.model,
+                    voice=self.voice,
+                    callback=collector
+                )
+            except Exception as e:
+                print(f"Error initializing TTS synthesizer for preparation: {e}")
+                return False
+                
+            # Process text in chunks for better streaming (same as in speak)
+            max_chunk_size = 100
+            chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
+            
+            for chunk in chunks:
+                # Send text to TTS engine
+                try:
+                    synthesizer.streaming_call(chunk)
+                except Exception as e:
+                    print(f"Error in preparation streaming_call: {e}")
+                    continue
+                    
+            # Signal completion
+            try:
+                synthesizer.streaming_complete()
+            except Exception as e:
+                print(f"Error in preparation streaming_complete: {e}")
+                
+            # Store the collected data if successful
+            if collector.had_data:
+                self.prepared_data = collector.data_chunks
+                print(f"Successfully prepared synthesis for: {text[:30]}...")
+                return True
+            else:
+                print(f"No data produced during preparation: {collector.error_msg}")
+                self.prepared_data = None
+                return False
+                
+        except Exception as e:
+            print(f"Error during synthesis preparation: {e}")
+            self.prepared_data = None
+            return False
+            
+        return True
+        
+    def play_prepared(self) -> Dict[str, Any]:
+        """Play previously prepared speech
+        
+        Returns:
+            Dict with:
+                'success': Boolean indicating success status
+                'error': Error message if any (None if success)
+        """
+        result = {
+            "success": False,
+            "error": None
+        }
+        
+        # If no prepared data, return error
+        if not self.prepared_text:
+            result["error"] = "No prepared text available"
+            print(result["error"])
+            return result
+            
+        # If prepared data available, play it
+        if self.prepared_data:
+            try:
+                print(f"Playing prepared speech: {self.prepared_text[:30]}...")
+                
+                # Initialize the player for audio playback
+                player = RealtimeMp3Player(verbose=False)
+                
+                # Start the player
+                if not player.start():
+                    result["error"] = "Failed to start audio player for prepared speech"
+                    print(result["error"])
+                    return self._use_fallback_tts(self.prepared_text)
+                
+                # Set speaking flag
+                self.is_speaking = True
+                
+                # Play all the data chunks
+                for chunk in self.prepared_data:
+                    player.write(chunk)
+                    
+                # Success!
+                result["success"] = True
+                
+                # Give a moment for audio to finish
+                time.sleep(0.1)
+                
+            except Exception as e:
+                result["error"] = f"Error playing prepared speech: {e}"
+                print(result["error"])
+                # Fall back to regular speak
+                return self.speak(self.prepared_text)
+                
+            finally:
+                # Clean up
+                self.is_speaking = False
+                if 'player' in locals() and player is not None:
+                    player.stop()
+                    
+        else:
+            # No prepared data available, fall back to normal speak
+            print("No prepared data available, using regular speak")
+            return self.speak(self.prepared_text)
+            
+        return result

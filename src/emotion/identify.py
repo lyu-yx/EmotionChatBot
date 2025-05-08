@@ -9,8 +9,10 @@ import torch.nn.functional as F
 import threading
 from typing import Dict, Any, Optional, List, Callable
 from PIL import ImageFont, ImageDraw, Image
+from PIL import ImageFont, ImageDraw, Image
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 def cv2_putText_cn(img, text, position, font_path="simhei.ttf", font_size=32, color=(0, 255, 0)):
     """
@@ -264,6 +266,7 @@ class EmotionDetectorCamera:
                     
                 # Draw text on frame
                 text = f"{emotion}: {prob*100:.1f}%" if prob > 0 else "Detecting..."
+                frame = cv2_putText_cn(frame, text, (10, 30))
                 frame = cv2_putText_cn(frame, text, (10, 30))
                 
                 # Display video
