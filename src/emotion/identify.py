@@ -423,7 +423,6 @@ class EmotionDetectorCamera:
             if not ret:
                 print("Unable to get video frame")
                 break
-
             current_time = time.time()
 
             # 在每一帧都绘制检测框和特征点
