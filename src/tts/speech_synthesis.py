@@ -11,6 +11,8 @@ import dashscope
 from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
 import threading
 from src.core.SharedQueue import SharedQueue as q
+import threading
+from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
 import queue
