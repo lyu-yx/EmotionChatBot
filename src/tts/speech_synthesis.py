@@ -11,6 +11,8 @@ import dashscope
 from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
 import threading
 from src.core.SharedQueue import SharedQueue as q
+import threading
+from src.core.SharedQueue import SharedQueue as q
 # Import the real-time MP3 player
 from .realtime_player import RealtimeMp3Player
 import queue
@@ -192,6 +194,14 @@ class StreamingTTSSynthesizer(TextToSpeech):
                             try:
                                 synthesizer.streaming_cancel()
                                 self.queue.clear()
+                                try:
+                                    self.interrupt = False
+                                    self.thread_stop_event.set()
+                                    self.is_speaking = False
+                                except Exception as e:
+                                    print(f"Error stopping player: {e}")
+                                time.sleep(0.4)
+                                self.speak("我在")
                             except Exception as e:
                                 print(f"Cancel failed: {e}")
             except queue.Empty:
@@ -354,8 +364,9 @@ class StreamingTTSSynthesizer(TextToSpeech):
             # Make sure to stop the player
             try:
                 self.interrupt = False
-                #self.thread_stop_event.set()
+                self.thread_stop_event.set()
                 self.is_speaking = False
+                self.queue.clear()
                 if 'player' in locals() and player is not None:
                     player.stop()
             except Exception as e:

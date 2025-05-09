@@ -272,11 +272,11 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             result["error"] = f"Error during speech recognition: {e}"
             print(f"\nError during Dashscope speech recognition: {e}")
             # Use simulated response as fallback
-            sim_result = self._get_simulated_response()
-            result["text"] = sim_result["text"]
-            result["success"] = True
-            result["engine"] = "simulation_fallback"
-            print(f"Using simulated response: {sim_result['text']}")
+            #sim_result = self._get_simulated_response()
+            # result["text"] = sim_result["text"]
+            # result["success"] = True
+            # result["engine"] = "simulation_fallback"
+            # print(f"Using simulated response: {sim_result['text']}")
         
         return result
     

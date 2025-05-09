@@ -413,7 +413,20 @@ class MedicalDiagnosisChatbot:
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
             time.sleep(0.05)  # Small sleep to prevent CPU overuse
-    
+    def listen(self) -> Dict[str, Any]:
+        """Listen for user input via microphone
+
+        Returns:
+            Dict with recognition results
+        """
+        # Don't listen if we're currently speaking
+        with self.lock:
+            if self.is_speaking:
+                print("Speaking in progress, postponing listening...")
+                time.sleep(0.5)  # Small delay to check again
+
+        return self.recognizer.recognize_from_microphone()
+
     def speak(self, text: str) -> Dict[str, Any]:
         """Convert text to speech and speak it, with protection against recording
         
