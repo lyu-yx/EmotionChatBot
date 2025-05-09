@@ -68,11 +68,11 @@ def main():
     emotion_group = parser.add_argument_group('Emotion Detection')
     emotion_group.add_argument("--text-emotion", action="store_true", 
                         help="Enable text-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-emotion", action="store_true",
+    emotion_group.add_argument("--camera-emotion", action="store_true",default = True,
                         help="Enable camera-based emotion detection (default: disabled)")
     emotion_group.add_argument("--camera-id", type=int, default=0,
                         help="Camera ID to use for emotion detection (default: 0)")
-    emotion_group.add_argument("--show-camera", action="store_true",
+    emotion_group.add_argument("--show-camera", action="store_true",default = True,
                         help="Show camera feed window (default: hidden)")
     
     # Wake word and activation settings
@@ -85,7 +85,7 @@ def main():
                      help="Enable debug mode to show detailed wake word detection information")
     
     # Other arguments
-    parser.add_argument("--exit-phrase", default="exit",
+    parser.add_argument("--exit-phrase", default="再见",
                         help="Phrase to exit the chatbot (default: 'exit')")
     parser.add_argument("--full", action="store_true", 
                         help="Use full response mode instead of streaming speech chunks")

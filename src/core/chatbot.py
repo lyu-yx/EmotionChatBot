@@ -203,13 +203,13 @@ class EmotionAwareStreamingChatbot:
         self.listen_thread.daemon = True
         self.listen_interrupt_stop = threading.Event()
         
-        # Processing thread for LLM
-        self.llm_thread = threading.Thread(target=self.llm_process_continuous)
-        self.llm_thread.daemon = True
+        # # Processing thread for LLM
+        # self.llm_thread = threading.Thread(target=self.llm_process_continuous)
+        # self.llm_thread.daemon = True
         
-        # Processing thread for TTS
-        self.tts_thread = threading.Thread(target=self.tts_process_continuous)
-        self.tts_thread.daemon = True
+        # # Processing thread for TTS
+        # self.tts_thread = threading.Thread(target=self.tts_process_continuous)
+        # self.tts_thread.daemon = True
         
         # Lock to avoid listen confliction
         self.listen_lock = lock()
@@ -224,6 +224,14 @@ class EmotionAwareStreamingChatbot:
             
         # Dynamic threshold adjustment
         self.dynamic_threshold_enabled = True
+        
+        # Emotion monitoring thread
+        self._emotion_monitor_active = False
+        self._emotion_monitor_thread = None
+        self._stop_emotion_monitor = threading.Event()
+        self.emotion_window = deque(maxlen=10)  # 10秒滑动窗口
+        self.negative_threshold = 0.5
+        self._passive_running = False
             
         # Threads will be started in the run_continuous method
         print("Emotion-Aware Streaming Chatbot initialized")
@@ -260,8 +268,7 @@ class EmotionAwareStreamingChatbot:
                             self.asr_queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
-            time.sleep(0.05)  # Small sleep to prevent CPU overuse
-    
+
     def _get_audio_level(self):
         """Get current audio input level for barge-in detection"""
         try:
@@ -554,33 +561,6 @@ class EmotionAwareStreamingChatbot:
         return sentences
     
 
-        #Flag to judge whether the bot is active
-        self.is_active = False
-
-        # Lock for thread safety
-        self.lock = threading.Lock()
-
-        #Store the message
-        self.queue = q()
-
-        #Control the listen_continuous thread
-        self.listen_all = threading.Thread(target = self.listen_continuous)
-        self.listen_all.daemon = True
-        self.listen_interrupt_stop = threading.Event()
-
-        #Lock to avoid listen confliction
-        self.listen_lock = lock()
-
-        # Emotion monitoring thread
-        self._emotion_monitor_active = False
-        self._emotion_monitor_thread = None
-        self._stop_emotion_monitor = threading.Event()
-        self.emotion_window = deque(maxlen=10)  # 10秒滑动窗口
-        self.negative_threshold = 0.5
-        self._passive_running = False
-
-        print("Emotion-Aware Streaming Chatbot initialized")
-
     def start_emotion_monitoring(self):
         """Start the background emotion monitoring thread"""
         if self._emotion_monitor_thread is None or not self._emotion_monitor_thread.is_alive():
@@ -609,7 +589,7 @@ class EmotionAwareStreamingChatbot:
             self.emotion_window.append(is_negative)
 
             # 每0.5秒检测一次（10秒窗口=20次检测）
-            #time.sleep(0.5)
+            time.sleep(0.5)
 
             # 当窗口满时计算负面情绪占比
             if len(self.emotion_window) == self.emotion_window.maxlen:
@@ -974,7 +954,6 @@ class EmotionAwareStreamingChatbot:
         import random  # For audio calibration
         
         language_display = "Chinese" if self.language.startswith("zh") else "English"
-        self.start_emotion_monitoring()
         # Prepare emotion detection mode for display
         emotion_modes = []
         if self.use_text_emotion:
