@@ -210,7 +210,8 @@ class EmotionAwareStreamingChatbot:
         # # Processing thread for TTS
         # self.tts_thread = threading.Thread(target=self.tts_process_continuous)
         # self.tts_thread.daemon = True
-        
+        # wake word list
+        self.wake_word_list = ["你好助手","您好助手","你好","您好"]
         # Lock to avoid listen confliction
         self.listen_lock = lock()
         
@@ -1060,7 +1061,7 @@ class EmotionAwareStreamingChatbot:
                                 break
 
                             # Check if user said the wake word
-                            if wake_word.lower() in text:
+                            if any(w.lower() in text.lower() for w in self.wake_word_list):
                                 print(f"Wake word detected: '{text}'")
                                 wake_word_detected = True
                                 self.is_active = True
