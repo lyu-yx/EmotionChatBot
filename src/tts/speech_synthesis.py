@@ -174,7 +174,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
         self.interrupt = False
         self.thread_stop_event = threading.Event()
         self.interrupt_event = threading.Event()
-        self.interrupt_word = "你好助手"
+        self.interrupt_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
         self.queue = q()
         self.is_speaking = False
         
@@ -187,7 +187,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
             try:
                 result = self.queue.peek()
                 if result:
-                    if self.interrupt_word in result["text"]:
+                    if any(w.lower() in result["text"] for w in self.interrupt_word_list):
                         self.interrupt = True
                         self.interrupt_event.set()
                         if getattr(synthesizer, "_is_started", False):

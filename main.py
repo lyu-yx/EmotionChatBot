@@ -140,7 +140,7 @@ def main():
         print("Text-based emotion detection disabled")
     
     # Create the chatbot with appropriate camera settings
-    chatbot = EmotionAwareStreamingChatbot(  #TODO:1.streaming response to reduce waiting time 2.merge lgz branch 3.continue listen 
+    chatbot = EmotionAwareStreamingChatbot(  #TODO:1.streaming response to reduce waiting time 2.merge lgz branch(done) 3.continue listen(done) 
         recognizer=recognizer,
         tts=tts,
         llm=llm,

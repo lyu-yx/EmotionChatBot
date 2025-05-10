@@ -134,26 +134,27 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         # Store the final recognized text (not intermediate results)
         final_text = ""
         current_sentence = ""
-        
+        if not hasattr(self, "_mic"):
+            self._mic = pyaudio.PyAudio()
+        if not hasattr(self, "_mic_stream") or self._mic_stream is None:
+            self._mic_stream = self._mic.open(format=pyaudio.paInt16,
+                                          channels=1,
+                                          rate=16000,
+                                          input=True)
         # Real-time speech recognition callback
         class Callback(RecognitionCallback):
             def on_open(self) -> None:
                 print('RecognitionCallback open.')
-                self.mic = pyaudio.PyAudio()
-                self.stream = self.mic.open(format=pyaudio.paInt16,
-                              channels=1,
-                              rate=16000,
-                              input=True)
 
             def on_close(self) -> None:
                 print('RecognitionCallback close.')
-                if hasattr(self, 'stream') and self.stream:
-                    self.stream.stop_stream()
-                    self.stream.close()
-                if hasattr(self, 'mic') and self.mic:
-                    self.mic.terminate()
-                self.stream = None
-                self.mic = None
+                # if hasattr(self, 'stream') and self.stream:
+                #     self.stream.stop_stream()
+                #     self.stream.close()
+                # if hasattr(self, 'mic') and self.mic:
+                #     self.mic.terminate()
+                # self.stream = None
+                # self.mic = None
 
             def on_complete(self) -> None:
                 print('RecognitionCallback completed.')
@@ -186,7 +187,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         
         # Create the callback
         callback = Callback()
-        
+        callback.stream = self._mic_stream
         try:
             # Call recognition service in async mode
             recognition = Recognition(

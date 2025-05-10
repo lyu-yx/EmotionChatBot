@@ -211,7 +211,7 @@ class EmotionAwareStreamingChatbot:
         # self.tts_thread = threading.Thread(target=self.tts_process_continuous)
         # self.tts_thread.daemon = True
         # wake word list
-        self.wake_word_list = ["你好助手","您好助手","你好","您好"]
+        self.wake_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
         # Lock to avoid listen confliction
         self.listen_lock = lock()
         
@@ -655,18 +655,6 @@ class EmotionAwareStreamingChatbot:
         except Exception as e:
             print(f"讲笑话失败: {e}")
             self.speak("哎呀，我的笑话库卡住了")
-
-    def listen_continuous(self):
-        while True:
-            with self.listen_lock:
-                if not self.listen_interrupt_stop.is_set():
-                    try :
-                        result = self.recognizer.recognize_from_microphone()
-                        if result and result["text"] != '':
-                            self.queue.put(result)
-                    except Exception as e:
-                        print(f"监听线程异常：{e}")
-            time.sleep(0.3)
 
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
