@@ -9,6 +9,8 @@ import pyaudio
 import numpy as np
 from datetime import datetime
 import logging
+from src.core.SharedAudio import AudioManager as Audio
+from src.core.SharedAudio import get_audio_manager
 logging.basicConfig(level=logging.INFO)
 class SpeechRecognizer(abc.ABC):
     """Abstract base class for speech recognition engines"""
@@ -60,6 +62,8 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         # Set model based on language
         self.model = 'paraformer-realtime-v2'
         print(f"Using Dashscope ASR model: {self.model}")
+        
+        self.audio_manager = get_audio_manager()
         
     def init_dashscope_api_key(self):
         """Set Dashscope API key from environment variable or config file"""
@@ -135,12 +139,14 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         final_text = ""
         current_sentence = ""
         if not hasattr(self, "_mic"):
-            self._mic = pyaudio.PyAudio()
+            self._mic = self.audio_manager
         if not hasattr(self, "_mic_stream") or self._mic_stream is None:
-            self._mic_stream = self._mic.open(format=pyaudio.paInt16,
-                                          channels=1,
-                                          rate=16000,
-                                          input=True)
+            self._mic_stream = self.audio_manager.get_mic_stream(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=16000,
+                block_size=self.block_size
+            )
         # Real-time speech recognition callback
         class Callback(RecognitionCallback):
             def on_open(self) -> None:

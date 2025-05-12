@@ -240,7 +240,7 @@ class EmotionAwareStreamingChatbot:
     def listen_continuous(self):
         """Continuously listen for user input in a background thread"""
         while True:
-            with self.listen_lock:
+            #with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
                     try:
                         # # Check if speech is ongoing and should be interrupted
