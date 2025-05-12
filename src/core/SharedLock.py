@@ -1,3 +1,4 @@
+# This class was originally written to address potential PyAudio conflicts, but it may no longer be necessary due to the AudioManager. It can be optimized in the future.
 import threading
 class SharedLock:
     _instance = None
