@@ -10,6 +10,7 @@ import threading
 from typing import Dict, Any, Optional, List, Callable
 from PIL import ImageFont, ImageDraw, Image
 import dlib
+
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -44,6 +45,8 @@ def cv2_putText_cn(img, text, position, font_path="simhei.ttf", font_size=32, co
 
     # 转换回OpenCV图像
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
 class Reshape(nn.Module):
     def __init__(self, *args):
         super(Reshape, self).__init__()
@@ -156,14 +159,14 @@ class EmotionDetectorCamera:
 
         # 表情阈值参数
         self.thresholds = {
-            'mouth_higth_happy': 0.03,
-            'mouth_higth_amazing': 0.02,
-            'eye_hight_amazing': 0.048,
+            'mouth_higth_happy': 0.028,
+            'mouth_higth_amazing': 0.025,
+            'eye_hight_amazing': 0.053,
             'brow_k_angry': -0.1,
             'mouth_higth_sad': -0.05,
-            'brow_width_disgust': 0.4,
+            'brow_width_disgust': 0.5,
             'eye_hight_fear': 0.05,
-            'mouth_core_width': 0.068,
+            'mouth_core_width': 0.06,
             'mouth_core_hight': 0.005
         }
 
@@ -218,7 +221,7 @@ class EmotionDetectorCamera:
             'eye_hight': eye_hight,
             'nose_wrinkling': nose_wrinkling,
             'mouth_core_width': mouth_core_width,
-            'mouth_core_hight' : mouth_core_hight
+            'mouth_core_hight': mouth_core_hight
         }
 
     def detect_emotion(self, features):
@@ -229,7 +232,7 @@ class EmotionDetectorCamera:
         if (features['eye_hight'] >= thresholds['eye_hight_amazing']):
             return "amazing"
         elif (features['mouth_higth'] >= thresholds['mouth_higth_amazing'] and
-                features['eye_hight'] >= thresholds['eye_hight_amazing']):
+              features['eye_hight'] >= thresholds['eye_hight_amazing']):
             return "amazing"
 
         # 开心 (嘴巴张大但眼睛不一定)
@@ -245,8 +248,7 @@ class EmotionDetectorCamera:
             return "sad"
 
         # 厌恶 (鼻子皱起+眉毛压低)
-        elif (features['nose_wrinkling'] < 0.32 and
-              features['brow_hight'] < 0.2):
+        elif (features['nose_wrinkling'] < 0.25) :
             return "disgust"
 
         # 恐惧 (眼睛睁大+眉毛上扬)
@@ -316,6 +318,7 @@ class EmotionDetectorCamera:
         # 释放资源q
         self.cap.release()
         cv2.destroyAllWindows()
+
     def _load_model(self):
         """Load model"""
         try:
@@ -413,6 +416,8 @@ class EmotionDetectorCamera:
 
     def _detection_loop(self, show_video: bool):
         last_detection_time = 0
+        current_emotion = "Neutral"  # 默认表情
+        current_face_rect = None  # 存储当前人脸位置
 
         while self.is_running and self.cap is not None:
             # Capture frame
@@ -420,15 +425,56 @@ class EmotionDetectorCamera:
             if not ret:
                 print("Unable to get video frame")
                 break
-
             current_time = time.time()
-            if current_time - last_detection_time >= self.detection_interval:
-                try:
-                    # 检测表情并绘制特征点
-                    frame = self._detect_emotion(frame)
-                    last_detection_time = current_time
-                except Exception as e:
-                    print(f"Emotion detection error: {str(e)}")
+
+            # 在每一帧都绘制检测框和特征点
+            img_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.detector(img_gray, 0)
+
+            if len(faces) != 0:
+                # 只处理第一个人脸
+                d = faces[0]
+                current_face_rect = d
+
+                # 用红色矩形框出人脸
+                cv2.rectangle(frame, (d.left(), d.top()), (d.right(), d.bottom()), (0, 0, 255), 2)
+
+                # 使用预测器得到68点数据的坐标
+                shape = self.predictor(frame, d)
+
+                # 绘制68个特征点（绿色小圆点）
+                for i in range(68):
+                    cv2.circle(frame, (shape.part(i).x, shape.part(i).y), 2, (0, 255, 0), -1)
+
+                # 在检测间隔时间进行表情检测
+                if current_time - last_detection_time >= self.detection_interval:
+                    try:
+                        features = self.get_landmark_features(shape, d)
+                        current_emotion = self.detect_emotion(features)
+
+                        # Update latest result
+                        with self.lock:
+                            self.latest_result = {
+                                "emotion": current_emotion,
+                                "emotion_index": self.EMOTION_CLASSES.index(current_emotion) if current_emotion in self.EMOTION_CLASSES else 6,
+                                "probability": 1.0,
+                                "all_probabilities": {emo: 1.0 if emo == current_emotion else 0.0 for emo in self.emotion_classes},
+                                "timestamp": time.time()
+                            }
+
+                            # Call callback function (if any)
+                            if self.callback is not None:
+                                self.callback(self.latest_result)
+
+                        last_detection_time = current_time
+                    except Exception as e:
+                        print(f"Emotion detection error: {str(e)}")
+
+                # 在脸上方显示当前表情（无论是否检测间隔都显示）
+                if current_face_rect is not None:
+                    cv2.putText(frame, current_emotion,
+                                (current_face_rect.left(), current_face_rect.top() - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
             # 如果需要显示视频
             if show_video:
@@ -444,50 +490,6 @@ class EmotionDetectorCamera:
             self.cap.release()
         if show_video:
             cv2.destroyAllWindows()
-
-    def _detect_emotion(self, frame):
-        img_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # 注意：这里用 BGR2GRAY，因为 OpenCV 默认读取 BGR
-        faces = self.detector(img_gray, 0)
-
-        emotion = "neutral"  # 默认值
-
-        if len(faces) != 0:
-            for k, d in enumerate(faces):
-                # 用红色矩形框出人脸
-                cv2.rectangle(frame, (d.left(), d.top()), (d.right(), d.bottom()), (0, 0, 255), 2)
-
-                # 使用预测器得到68点数据的坐标
-                shape = self.predictor(frame, d)
-
-                # 绘制68个特征点（绿色小圆点）
-                for i in range(68):
-                    cv2.circle(frame, (shape.part(i).x, shape.part(i).y), 2, (0, 255, 0), -1)
-
-                # 提取特征
-                features = self.get_landmark_features(shape, d)
-
-                # 检测表情
-                emotion = self.detect_emotion(features)
-
-                # 在脸上方显示检测到的表情
-                cv2.putText(frame, emotion, (d.left(), d.top() - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-        # Update latest result
-        with self.lock:
-            self.latest_result = {
-                "emotion": emotion,
-                "emotion_index": self.EMOTION_CLASSES.index(emotion) if emotion in self.EMOTION_CLASSES else 6,
-                "probability": 1.0,  # 特征点方法没有概率，设为1.0
-                "all_probabilities": {emo: 1.0 if emo == emotion else 0.0 for emo in self.emotion_classes},
-                "timestamp": time.time()
-            }
-
-            # Call callback function (if any)
-            if self.callback is not None:
-                self.callback(self.latest_result)
-
-        return frame  # 返回绘制了特征点和表情的帧
 
 
 # Example usage when running this script directly
