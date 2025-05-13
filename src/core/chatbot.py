@@ -167,64 +167,20 @@ class EmotionAwareStreamingChatbot:
         self.cache_timestamp = {}  # Track when items were added to cache
         self.max_cache_size = 100  # Maximum number of items in cache
         
-        # Barge-in control flags
-        self.speech_should_stop = threading.Event()
-        self.barge_in_sensitivity = 800  # Adjustable sensitivity (lower = more sensitive)
-        self.barge_in_history = []  # Track recent audio levels for better detection
-        self.barge_in_window_size = 5  # Number of samples to keep for barge-in detection
-        
-        # Audio level baseline for normalization
-        self.audio_baseline = 400  # Initial estimate, will be adjusted
-        self.audio_baseline_samples = []  # Samples for baseline calculation
-        
-        # Parallel processing threads and queues
-        self.asr_queue = queue.Queue()  # For speech recognition results
-        self.llm_queue = queue.Queue()  # For LLM processing results
-        self.tts_queue = queue.Queue()  # For TTS processing
-        
-        # Priority queue for high-priority responses
-        self.priority_tts_queue = queue.PriorityQueue(maxsize=5)
         
         # Prefetch settings
         self.prefetch_enabled = True
         self.preprocessing_complete = threading.Event()
-        
-        # Latency metrics
-        self.latency_metrics = {
-            "asr": [],
-            "llm": [],
-            "tts": [],
-            "total": []
-        }
-        self.max_metrics_samples = 50
         
         # Control the listen_continuous thread
         self.listen_thread = threading.Thread(target=self.listen_continuous)
         self.listen_thread.daemon = True
         self.listen_interrupt_stop = threading.Event()
         
-        # # Processing thread for LLM
-        # self.llm_thread = threading.Thread(target=self.llm_process_continuous)
-        # self.llm_thread.daemon = True
-        
-        # # Processing thread for TTS
-        # self.tts_thread = threading.Thread(target=self.tts_process_continuous)
-        # self.tts_thread.daemon = True
         # wake word list
         self.wake_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
         # Lock to avoid listen confliction
         self.listen_lock = lock()
-        
-        # Try to warm up the models with simple queries
-        # try:
-        #     # Warm up LLM with a simple request
-        #     self.llm.generate_response("Hello", [])
-        #     print("LLM model warmed up")
-        # except Exception as e:
-        #     print(f"LLM warmup failed (not critical): {e}")
-            
-        # Dynamic threshold adjustment
-        self.dynamic_threshold_enabled = True
         
         # Emotion monitoring thread
         self._emotion_monitor_active = False
@@ -243,325 +199,13 @@ class EmotionAwareStreamingChatbot:
             #with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
                     try:
-                        # # Check if speech is ongoing and should be interrupted
-                        # if self.is_speaking:
-                        #     # Check audio level to see if user is speaking
-                        #     # If audio level is above threshold, interrupt current speech
-                        #     audio_level = self._get_audio_level()
-                        #     if (audio_level > 0.5):  # Adjust threshold as needed
-                        #         print("User started speaking - interrupting current speech")
-                        #         self.speech_should_stop.set()
-                        #         with self.lock:
-                        #             self.is_speaking = False
-                        
                         # Recognize speech
                         result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
-                            # # Interrupt current speech when new input is detected
-                            # if self.is_speaking:
-                            #     print("New speech detected - interrupting current output")
-                            #     self.speech_should_stop.set()
-                            #     with self.lock:
-                            #         self.is_speaking = False
-                            
                             self.queue.put(result)
-                            # Also put in ASR queue for parallel processing
-                            self.asr_queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
-
-    def _get_audio_level(self):
-        """Get current audio input level for barge-in detection"""
-        try:
-            import pyaudio
-            import numpy as np
-            
-            # Use a short window to check audio level
-            CHUNK = 1024
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-            RATE = 16000
-            
-            p = pyaudio.PyAudio()
-            stream = p.open(format=FORMAT,
-                            channels=CHANNELS,
-                            rate=RATE,
-                            input=True,
-                            frames_per_buffer=CHUNK)
-            
-            # Read a small sample to check level
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            
-            # Calculate RMS as a measure of audio level
-            rms = np.sqrt(np.mean(np.square(audio_data)))
-            
-            # Clean up
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            
-            return rms
-        except Exception as e:
-            # Fall back to a default value if audio level detection fails
-            print(f"Audio level detection failed: {e}")
-            return 0
-            
-    def llm_process_continuous(self):
-        """Process LLM requests in a separate thread with improved caching and prefetching"""
-        import random  # For probabilistic preprocessing
-        
-        # Start preprocessing common responses
-        if self.prefetch_enabled:
-            preprocessing_thread = threading.Thread(
-                target=self.preprocess_common_responses,
-                daemon=True
-            )
-            preprocessing_thread.start()
-        
-        while True:
-            try:
-                # Get the next speech recognition result
-                asr_result = self.asr_queue.get(timeout=0.5)
-                
-                # Skip empty results
-                if not asr_result or not asr_result.get("text"):
-                    continue
-                
-                user_input = asr_result["text"]
-                start_time = time.time()
-                
-                # Update metrics for ASR (from recognition to LLM processing)
-                if hasattr(asr_result, 'timestamp'):
-                    asr_latency = start_time - asr_result.timestamp
-                    self.latency_metrics["asr"].append(asr_latency)
-                    self.latency_metrics["asr"] = self.latency_metrics["asr"][-self.max_metrics_samples:]
-                
-                # Check cache first for common responses
-                cache_hit = False
-                if user_input in self.response_cache:
-                    cached_response = self.response_cache[user_input]
-                    print(f"Cache hit: Using cached response for: {user_input}")
-                    
-                    # Update cache hit counter
-                    if user_input in self.cache_hit_counter:
-                        self.cache_hit_counter[user_input] += 1
-                    else:
-                        self.cache_hit_counter[user_input] = 1
                         
-                    # Update timestamp to extend TTL
-                    self.cache_timestamp[user_input] = time.time()
-                    
-                    # Put in high-priority queue for immediate response
-                    self.priority_tts_queue.put((
-                        1,  # Higher priority (lower number)
-                        {
-                            "input": user_input,
-                            "response": cached_response,
-                            "success": True,
-                            "from_cache": True
-                        }
-                    ))
-                    cache_hit = True
-                
-                # Process with LLM if not in cache
-                if not cache_hit:
-                    # Process emotion from text if enabled
-                    if self.use_text_emotion:
-                        current_emotion = self.process_emotion(user_input)
-                    
-                    # Get current emotion
-                    if self.use_camera_emotion:
-                        current_emotion = self.get_current_emotion()
-                    
-                    # Add emotion context to the user input
-                    emotion_context = f"[User emotion: {current_emotion}] "
-                    augmented_input = emotion_context + user_input
-                    
-                    # Start processing with LLM
-                    print(f"LLM thread processing: '{user_input}' (Emotion: {current_emotion})")
-                    
-                    llm_result = self.llm.generate_response(
-                        user_input=augmented_input,
-                        conversation_history=self.conversation_history
-                    )
-                    
-                    # Update LLM latency metrics
-                    llm_time = time.time() - start_time
-                    self.latency_metrics["llm"].append(llm_time)
-                    self.latency_metrics["llm"] = self.latency_metrics["llm"][-self.max_metrics_samples:]
-                    
-                    # Cache frequently used responses (only if appropriate)
-                    if llm_result["success"]:
-                        if len(user_input) < 25 and len(llm_result["response"]) < 150:
-                            # Check if this is a common question worth caching
-                            if random.random() < 0.8 or len(user_input) < 10:  # Higher chance for short inputs
-                                self.response_cache[user_input] = llm_result["response"]
-                                self.cache_timestamp[user_input] = time.time()
-                                self.cache_hit_counter[user_input] = 1  # Initialize counter
-                                print(f"Cached new response for: {user_input}")
-                        
-                        # Update conversation history
-                        self.conversation_history.append({"role": "user", "content": user_input})
-                        self.conversation_history.append({"role": "assistant", "content": llm_result["response"]})
-                        
-                        # Trim history if it exceeds maximum length
-                        if len(self.conversation_history) > self.max_history_length * 2:
-                            self.conversation_history = self.conversation_history[-self.max_history_length*2:]
-                    
-                    # Regular priority for non-cached responses
-                    self.llm_queue.put({
-                        "input": user_input,
-                        "response": llm_result["response"],
-                        "success": llm_result["success"],
-                        "error": llm_result.get("error"),
-                        "emotion": current_emotion,
-                        "from_cache": False
-                    })
-                
-                # Update total latency metrics (from recognition to LLM completion)
-                total_time = time.time() - start_time
-                self.latency_metrics["total"].append(total_time)
-                self.latency_metrics["total"] = self.latency_metrics["total"][-self.max_metrics_samples:]
-                
-                # Print performance insights occasionally
-                if random.random() < 0.1:  # 10% chance
-                    self._print_performance_insights()
-                
-            except queue.Empty:
-                # Queue timeout, continue waiting
-                pass
-            except Exception as e:
-                print(f"LLM thread exception: {e}")
-                
-            time.sleep(0.05)  # Small sleep to prevent CPU overuse
-    
-    def tts_process_continuous(self):
-        """Process TTS requests in a separate thread with enhanced interruption handling"""
-        while True:
-            try:
-                # Check priority queue first (for interruptions and urgent responses)
-                try:
-                    # Non-blocking check of priority queue (timeout=0.01)
-                    priority, llm_result = self.priority_tts_queue.get(timeout=0.01)
-                    print(f"Processing priority TTS request (priority: {priority})")
-                except queue.Empty:
-                    # If no priority items, get from regular queue
-                    llm_result = self.llm_queue.get(timeout=0.5)
-                
-                # Skip failed results
-                if not llm_result["success"]:
-                    print(f"Skipping TTS for failed LLM result: {llm_result.get('error')}")
-                    continue
-                print("Success get llm result")
-                response_text = llm_result["response"]
-                from_cache = llm_result.get("from_cache", False)
-                
-                # Split into sentences for faster response
-                sentences = self._split_into_sentences(response_text)
-                
-                # Prepare first sentence immediately for faster response
-                if sentences and not from_cache:
-                    first_sentence = sentences[0]
-                    try:
-                        # Prepare synthesis but don't play yet
-                        self.tts.prepare_synthesis(first_sentence)
-                    except Exception as e:
-                        print(f"TTS preparation exception: {e}")
-                
-                # Process each sentence with interruption handling
-                for i, sentence in enumerate(sentences):
-                    # Check if we should stop speaking before starting next sentence
-                    # if self.speech_should_stop.is_set():
-                    #     print("TTS interrupted - stopping speech")
-                    #     self.speech_should_stop.clear()
-                    #     break
-                    
-                    # Set speaking flag
-                    with self.lock:
-                        self.is_speaking = True
-                    
-                    start_time = time.time()
-                    
-                    # Speak the sentence
-                    try:
-                        # Track if this is cached content for metrics
-                        is_cached = from_cache or (i > 0)  # First sentence might be prepared
-                        
-                        # Actually speak the prepared sentence or a new one
-                        if i == 0 and not from_cache:
-                            # Use the prepared sentence
-                            self.tts.play_prepared()
-                        else:
-                            # Synthesize and play directly
-                            self.tts.speak(sentence)
-                        
-                        # Record TTS latency for monitoring
-                        tts_time = time.time() - start_time
-                        self.latency_metrics["tts"].append(tts_time)
-                        self.latency_metrics["tts"] = self.latency_metrics["tts"][-self.max_metrics_samples:]
-                        
-                    except Exception as e:
-                        print(f"TTS exception: {e}")
-                    
-                    # Prepare next sentence while speaking current one (if not last)
-                    if i < len(sentences) - 1 and not self.speech_should_stop.is_set():
-                        try:
-                            next_sentence = sentences[i + 1]
-                            self.tts.prepare_synthesis(next_sentence)
-                        except Exception as e:
-                            print(f"TTS preparation exception: {e}")
-                    
-                    # Clear speaking flag after each sentence
-                    with self.lock:
-                        self.is_speaking = False
-                    
-                    # Small pause between sentences for natural speech rhythm
-                    # Adjust pause based on punctuation
-                    if i < len(sentences) - 1:  # Don't pause after last sentence
-                        if sentence.endswith((".", "!", "?")):
-                            time.sleep(0.15)  # Longer pause for sentence boundaries
-                        elif sentence.endswith((",", ";", ":")):
-                            time.sleep(0.1)  # Medium pause for clause boundaries
-                        else:
-                            time.sleep(0.05)  # Short pause otherwise
-                
-                # Run cache management periodically
-                if random.random() < 0.05:  # 5% chance on each response
-                    threading.Thread(target=self.manage_cache, daemon=True).start()
-                
-            except queue.Empty:
-                # Queue timeout, continue waiting
-                pass
-            except Exception as e:
-                print(f"TTS thread exception: {e}")
-                # Make sure to reset speaking flag on error
-                with self.lock:
-                    self.is_speaking = False
-                    
-            time.sleep(0.02)  # Small sleep to prevent CPU overuse
-    
-    def _split_into_sentences(self, text):
-        """Split text into sentences for better streaming"""
-        sentences = []
-        current = ""
-        
-        # Process character by character
-        for char in text:
-            current += char
-            
-            # Check if we've reached a sentence boundary
-            if char in self.sentence_end_chars:
-                sentences.append(current)
-                current = ""
-        
-        # Add any remaining text
-        if current:
-            sentences.append(current)
-            
-        return sentences
-    
-
     def start_emotion_monitoring(self):
         """Start the background emotion monitoring thread"""
         if self._emotion_monitor_thread is None or not self._emotion_monitor_thread.is_alive():
@@ -572,13 +216,6 @@ class EmotionAwareStreamingChatbot:
             )
             self._emotion_monitor_thread.start()
             print("Started background emotion monitoring")
-
-    def stop_emotion_monitoring(self):
-        """Stop the background emotion monitoring thread"""
-        self._stop_emotion_monitor.set()
-        if self._emotion_monitor_thread is not None:
-            self._emotion_monitor_thread.join(timeout=1)
-            print("Stopped background emotion monitoring")
 
     def _emotion_monitor_loop(self):
         while not self._stop_emotion_monitor.is_set():
@@ -684,20 +321,6 @@ class EmotionAwareStreamingChatbot:
 
         # Fall back to text emotion or neutral
         return self.text_emotion if self.use_text_emotion else "neutral"
-
-    def listen(self) -> Dict[str, Any]:
-        """Listen for user input via microphone
-
-        Returns:
-            Dict with recognition results
-        """
-        # Don't listen if we're currently speaking
-        with self.lock:
-            if self.is_speaking:
-                print("Speaking in progress, postponing listening...")
-                time.sleep(0.5)  # Small delay to check again
-
-        return self.recognizer.recognize_from_microphone()
 
     def process_emotion(self, text: str) -> str:
         """Process text to detect emotions and update user emotional state
@@ -940,8 +563,6 @@ class EmotionAwareStreamingChatbot:
 
     def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False, activation_timeout: int = 60, debug_mode: bool = True):
         """Run the chatbot in continuous mode with improved parallel processing"""
-        import random  # For audio calibration
-        
         language_display = "Chinese" if self.language.startswith("zh") else "English"
         # Prepare emotion detection mode for display
         emotion_modes = []
@@ -1001,22 +622,9 @@ class EmotionAwareStreamingChatbot:
         # Start all background threads
         print("Starting background threads...")
         self.listen_thread.start()
-        # self.llm_thread.start()
-        # self.tts_thread.start()
-        
-        # Periodically recalibrate audio baseline
-        last_calibration = time.time()
         
         while running:
             print("\n" + "="*50)
-            
-            # Periodically recalibrate audio baseline (every 30 minutes)
-            if time.time() - last_calibration > 1800:  # 30 minutes
-                print("Recalibrating audio baseline...")
-                # This will happen in the audio monitor thread
-                self.audio_baseline_samples = []
-                last_calibration = time.time()
-            
             # Check if we need to listen for wake word
             if using_wake_word and not self.is_active:
                 print(waiting_message)
@@ -1035,8 +643,6 @@ class EmotionAwareStreamingChatbot:
                                 print(f"DEBUG - Wake word phase recognized: '{text}'")
                                 print(f"DEBUG - Looking for wake word: '{wake_word.lower()}'")
                                 print(f"DEBUG - Wake word in text: {wake_word.lower() in text}")
-                                similarity = self._calculate_text_similarity(wake_word.lower(), text)
-                                print(f"DEBUG - Text similarity score: {similarity:.2f}")
 
                             # Check if user said the exit phrase
                             if text == exit_phrase.lower() or exit_phrase.lower() in text:
@@ -1110,285 +716,10 @@ class EmotionAwareStreamingChatbot:
                 running = False
                 self.is_active = False
                 print("Exiting chatbot...")
-
+                self.cleanup_emotion()
             # If there was an error, report it
             elif not result["success"] and result["error"]:
                 print("No message")
             
             # Brief pause between interactions
             time.sleep(0.25)
-    
-    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two text strings
-
-        Args:
-            text1: First text string
-            text2: Second text string
-
-        Returns:
-            Similarity score between 0 and 1
-        """
-        # Simple contains check
-        if text1 in text2:
-            return 1.0
-
-        # Check for partial matches
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-
-        if not words1 or not words2:
-            return 0.0
-
-        # Calculate Jaccard similarity
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-
-        return intersection / union if union > 0 else 0.0
-
-    def cleanup(self):
-        """Clean up resources when shutting down"""
-        # Stop emotion monitoring
-        self.stop_emotion_monitoring()
-
-        # Stop camera detector if it was initialized
-        if self.use_camera_emotion and self.camera_detector is not None:
-            try:
-                self.camera_detector.stop()
-                print("Camera emotion detection stopped")
-            except Exception as e:
-                print(f"Error stopping camera detection: {e}")
-    
-    def audio_level_monitor(self):
-        """Continuously monitor audio levels for improved barge-in detection"""
-        try:
-            import pyaudio
-            import numpy as np
-            import time
-            
-            # Initialize PyAudio
-            p = pyaudio.PyAudio()
-            
-            # Audio parameters
-            CHUNK = 512  # Smaller chunks for more frequent checks
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-            RATE = 16000
-            
-            # Open stream in non-blocking mode
-            stream = p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-                start=True,
-                input_device_index=None,
-                stream_callback=None
-            )
-            
-            # Calibration phase
-            print("Calibrating audio levels for barge-in detection...")
-            self.audio_baseline_samples = []
-            
-            # Collect baseline samples while not speaking
-            calibration_time = 2  # seconds
-            start_time = time.time()
-            while time.time() - start_time < calibration_time:
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                    audio_data = np.frombuffer(data, dtype=np.int16)
-                    rms = np.sqrt(np.mean(np.square(audio_data)))
-                    self.audio_baseline_samples.append(rms)
-                    time.sleep(0.01)  # Small sleep to prevent overwhelming the CPU
-                except Exception as e:
-                    print(f"Calibration sample error: {e}")
-            
-            # Calculate baseline from collected samples
-            if self.audio_baseline_samples:
-                # Use a percentile instead of mean to be robust against outliers
-                self.audio_baseline = np.percentile(self.audio_baseline_samples, 75)
-                print(f"Audio baseline level calibrated: {self.audio_baseline:.2f}")
-            
-            # Main monitoring loop
-            while True:
-                if self.is_speaking:
-                    try:
-                        # Check audio level
-                        data = stream.read(CHUNK, exception_on_overflow=False)
-                        audio_data = np.frombuffer(data, dtype=np.int16)
-                        
-                        # Calculate RMS
-                        rms = np.sqrt(np.mean(np.square(audio_data)))
-                        
-                        # Add to history
-                        self.barge_in_history.append(rms)
-                        # Keep history at fixed size
-                        if len(self.barge_in_history) > self.barge_in_window_size:
-                            self.barge_in_history.pop(0)
-                        
-                        # Dynamic threshold adjustment if enabled
-                        if self.dynamic_threshold_enabled and len(self.barge_in_history) >= 3:
-                            # Calculate average of recent levels
-                            recent_avg = sum(self.barge_in_history[-3:]) / 3
-                            
-                            # Check if current level is significantly higher (potential speech)
-                            threshold = self.barge_in_sensitivity
-                            
-                            # Adjust threshold based on speaking volume
-                            if recent_avg > self.audio_baseline * 2:
-                                # Higher threshold during louder output
-                                threshold = self.barge_in_sensitivity * 1.5
-                            
-                            # Trigger barge-in if threshold exceeded
-                            if rms > threshold:
-                                # Additional check: must exceed baseline by significant amount
-                                if rms > self.audio_baseline * 3:
-                                    print(f"Barge-in detected (Level: {rms:.2f}, Threshold: {threshold:.2f})")
-                                    self.speech_should_stop.set()
-                                    with self.lock:
-                                        self.is_speaking = False
-                    except Exception as e:
-                        if "Input overflowed" not in str(e):  # Ignore common overflow errors
-                            print(f"Audio monitoring error: {e}")
-                
-                time.sleep(0.02)  # Check frequently but don't overwhelm CPU
-                
-        except Exception as e:
-            print(f"Audio monitor thread error: {e}")
-        finally:
-            # Clean up resources
-            if 'stream' in locals() and stream:
-                stream.stop_stream()
-                stream.close()
-            if 'p' in locals() and p:
-                p.terminate()
-    
-    def manage_cache(self):
-        """Clean up and optimize the response cache"""
-        try:
-            current_time = time.time()
-            
-            # Items to remove
-            to_remove = []
-            
-            # Check each item in cache
-            for key in self.response_cache:
-                # Check if TTL expired
-                if key in self.cache_timestamp:
-                    age = current_time - self.cache_timestamp[key]
-                    if age > self.cache_ttl:
-                        to_remove.append(key)
-            
-            # Remove expired items
-            for key in to_remove:
-                del self.response_cache[key]
-                if key in self.cache_timestamp:
-                    del self.cache_timestamp[key]
-                if key in self.cache_hit_counter:
-                    del self.cache_hit_counter[key]
-            
-            # If cache is still too large, remove least frequently used items
-            if len(self.response_cache) > self.max_cache_size:
-                # Sort by hit count (ascending)
-                sorted_items = sorted(
-                    self.cache_hit_counter.items(),
-                    key=lambda x: x[1]
-                )
-                
-                # Remove least used items until we're under the limit
-                items_to_remove = len(self.response_cache) - self.max_cache_size
-                for i in range(items_to_remove):
-                    if i < len(sorted_items):
-                        key = sorted_items[i][0]
-                        if key in self.response_cache:
-                            del self.response_cache[key]
-                            if key in self.cache_timestamp:
-                                del self.cache_timestamp[key]
-                            if key in self.cache_hit_counter:
-                                del self.cache_hit_counter[key]
-            
-            if to_remove:
-                print(f"Cache cleanup: removed {len(to_remove)} expired items")
-                
-        except Exception as e:
-            print(f"Cache management error: {e}")
-    
-    def preprocess_common_responses(self):
-        """Preprocess common responses for faster retrieval"""
-        if not self.prefetch_enabled:
-            return
-        
-        common_phrases = []
-        
-        # Language-specific common phrases
-        if self.language.startswith("zh"):
-            common_phrases = [
-                "你好",
-                "谢谢",
-                "再见",
-                "是的",
-                "不是",
-                "我不知道",
-                "请帮我",
-                "什么时候",
-                "现在几点",
-                "今天天气怎么样"
-            ]
-        else:
-            common_phrases = [
-                "hello",
-                "thank you",
-                "goodbye",
-                "yes",
-                "no",
-                "I don't know",
-                "please help me",
-                "what time is it",
-                "what's the weather today",
-                "how are you"
-            ]
-        
-        print("Preprocessing common responses...")
-        
-        # Process common phrases in background
-        for phrase in common_phrases:
-            if phrase not in self.response_cache:
-                try:
-                    # Generate response for common phrase
-                    result = self.llm.generate_response(
-                        user_input=phrase,
-                        conversation_history=[]
-                    )
-                    
-                    if result["success"]:
-                        # Add to cache
-                        self.response_cache[phrase] = result["response"]
-                        self.cache_timestamp[phrase] = time.time()
-                        self.cache_hit_counter[phrase] = 0
-                        print(f"Preprocessed: '{phrase}'")
-                except Exception as e:
-                    print(f"Error preprocessing '{phrase}': {e}")
-        
-        self.preprocessing_complete.set()
-        print("Common response preprocessing completed")
-    
-    def _print_performance_insights(self):
-        """Print performance metrics for monitoring"""
-        try:
-            metrics = []
-            
-            # Only print metrics that have data
-            for name, values in self.latency_metrics.items():
-                if values:
-                    avg = sum(values) / len(values)
-                    metrics.append(f"{name}={avg:.3f}s")
-            
-            if metrics:
-                print(f"Performance metrics (avg): {', '.join(metrics)}")
-                
-            # Print cache stats
-            cache_size = len(self.response_cache)
-            print(f"Response cache: {cache_size} items")
-            
-        except Exception as e:
-            print(f"Error printing performance insights: {e}")
