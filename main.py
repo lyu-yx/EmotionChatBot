@@ -165,10 +165,6 @@ def main():
         print("\nExiting chatbot due to keyboard interrupt...")
     except Exception as e:
         print(f"Error running chatbot: {e}")
-    finally:
-        # Clean up resources
-        chatbot.cleanup()
-    
     print("Chatbot session ended.")
 
 

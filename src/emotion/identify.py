@@ -416,6 +416,8 @@ class EmotionDetectorCamera:
 
     def _detection_loop(self, show_video: bool):
         last_detection_time = 0
+        current_emotion = "Neutral"  # 默认表情
+        current_face_rect = None  # 存储当前人脸位置
 
         while self.is_running and self.cap is not None:
             # Capture frame
@@ -430,48 +432,49 @@ class EmotionDetectorCamera:
             faces = self.detector(img_gray, 0)
 
             if len(faces) != 0:
-                for k, d in enumerate(faces):
-                    # 用红色矩形框出人脸
-                    cv2.rectangle(frame, (d.left(), d.top()), (d.right(), d.bottom()), (0, 0, 255), 2)
+                # 只处理第一个人脸
+                d = faces[0]
+                current_face_rect = d
 
-                    # 使用预测器得到68点数据的坐标
-                    shape = self.predictor(frame, d)
+                # 用红色矩形框出人脸
+                cv2.rectangle(frame, (d.left(), d.top()), (d.right(), d.bottom()), (0, 0, 255), 2)
 
-                    # 绘制68个特征点（绿色小圆点）
-                    for i in range(68):
-                        cv2.circle(frame, (shape.part(i).x, shape.part(i).y), 2, (0, 255, 0), -1)
+                # 使用预测器得到68点数据的坐标
+                shape = self.predictor(frame, d)
 
-            # 只在检测间隔时间进行表情检测
-            if current_time - last_detection_time >= self.detection_interval:
-                try:
-                    # 检测表情
-                    if len(faces) > 0:
-                        for k, d in enumerate(faces):
-                            shape = self.predictor(frame, d)
-                            features = self.get_landmark_features(shape, d)
-                            emotion = self.detect_emotion(features)
+                # 绘制68个特征点（绿色小圆点）
+                for i in range(68):
+                    cv2.circle(frame, (shape.part(i).x, shape.part(i).y), 2, (0, 255, 0), -1)
 
-                            # 在脸上方显示检测到的表情
-                            cv2.putText(frame, emotion, (d.left(), d.top() - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                # 在检测间隔时间进行表情检测
+                if current_time - last_detection_time >= self.detection_interval:
+                    try:
+                        features = self.get_landmark_features(shape, d)
+                        current_emotion = self.detect_emotion(features)
 
-                            # Update latest result
-                            with self.lock:
-                                self.latest_result = {
-                                    "emotion": emotion,
-                                    "emotion_index": self.EMOTION_CLASSES.index(emotion) if emotion in self.EMOTION_CLASSES else 6,
-                                    "probability": 1.0,  # 特征点方法没有概率，设为1.0
-                                    "all_probabilities": {emo: 1.0 if emo == emotion else 0.0 for emo in self.emotion_classes},
-                                    "timestamp": time.time()
-                                }
+                        # Update latest result
+                        with self.lock:
+                            self.latest_result = {
+                                "emotion": current_emotion,
+                                "emotion_index": self.EMOTION_CLASSES.index(current_emotion) if current_emotion in self.EMOTION_CLASSES else 6,
+                                "probability": 1.0,
+                                "all_probabilities": {emo: 1.0 if emo == current_emotion else 0.0 for emo in self.emotion_classes},
+                                "timestamp": time.time()
+                            }
 
-                                # Call callback function (if any)
-                                if self.callback is not None:
-                                    self.callback(self.latest_result)
+                            # Call callback function (if any)
+                            if self.callback is not None:
+                                self.callback(self.latest_result)
 
-                    last_detection_time = current_time
-                except Exception as e:
-                    print(f"Emotion detection error: {str(e)}")
+                        last_detection_time = current_time
+                    except Exception as e:
+                        print(f"Emotion detection error: {str(e)}")
+
+                # 在脸上方显示当前表情（无论是否检测间隔都显示）
+                if current_face_rect is not None:
+                    cv2.putText(frame, current_emotion,
+                                (current_face_rect.left(), current_face_rect.top() - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
             # 如果需要显示视频
             if show_video:

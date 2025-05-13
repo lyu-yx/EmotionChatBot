@@ -200,7 +200,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
                                     self.is_speaking = False
                                 except Exception as e:
                                     print(f"Error stopping player: {e}")
-                                time.sleep(0.4)
+                                time.sleep(1)
                                 self.speak("我在")
                             except Exception as e:
                                 print(f"Cancel failed: {e}")
