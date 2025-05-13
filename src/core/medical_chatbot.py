@@ -1313,7 +1313,7 @@ class MedicalDiagnosisChatbot:
                 # Give feedback based on relevance
                 if not self.response_relevant:
                     response_message = "您的回答可能与问题不太相关，让我们再试一次。"
-                    self.speak(response_message)
+                    #self.speak(response_message)
                     result["response"] = response_message
                 else:
                     result["response"] = "收到您的回答，继续下一个问题。"
@@ -1373,8 +1373,6 @@ class MedicalDiagnosisChatbot:
             
             # Check if user wants to exit
             if result["user_input"] and exit_phrase in result["user_input"]:
-                goodbye = "感谢您的配合，问诊已结束。祝您健康！"
-                self.speak(goodbye)
                 running = False
             
             # Brief pause between interactions
