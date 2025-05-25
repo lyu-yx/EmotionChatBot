@@ -1,4 +1,4 @@
-# Updated identify.py using DeepFace instead of dlib 68 landmarks
+# Updated identify.py with 5-second stable heart rate display
 
 import torch
 import cv2
@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional, Callable
 from PIL import ImageFont, ImageDraw, Image
 import collections
 from deepface import DeepFace
+from scipy.signal import find_peaks, butter, filtfilt
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -24,13 +25,19 @@ emotion_window = collections.deque(maxlen=VOTE_WINDOW)
 # 表情偏置权重
 bias_weights = {
     "happy": 1,
-    "neutral": 0.5,
-    "sad": 2,
-    "angry": 0.9,
+    "neutral": 1,
+    "sad": 1.5,
+    "angry": 0.7,
     "fear": 1.0,
     "disgust": 1.0,
     "surprise": 1.6
 }
+
+# 心跳检测参数
+HR_FPS = 30
+HR_WINDOW_SIZE = HR_FPS * 5  # 5秒数据
+HR_UPDATE_INTERVAL = 3.0  # 每5秒更新一次心率
+HR_SMOOTHING_WINDOW = 3  # 心率平滑窗口大小
 
 
 def cv2_putText_cn(img, text, position, font_path="simhei.ttf", font_size=32, color=(0, 255, 0)):
@@ -67,6 +74,14 @@ class EmotionDetectorCamera:
             "all_probabilities": {emotion: 0.0 for emotion in self.emotion_classes},
             "timestamp": time.time()
         }
+
+        # 心跳检测相关变量
+        self.hr_signal_buffer = []
+        self.last_hr_update_time = 0
+        self.locked_hr_value = None  # 锁定的心率值
+        self.is_hr_calculating = False
+        self.hr_display = "Calculating HR..."
+        self.hr_history = []  # 心率历史记录用于平滑
 
         print(f"Camera emotion detector initialized, using device: {device}")
         self.cap = cv2.VideoCapture(0)
@@ -126,11 +141,67 @@ class EmotionDetectorCamera:
 
     def get_latest_emotion(self) -> Dict[str, Any]:
         with self.lock:
-            return self.latest_result.copy()
+            result = self.latest_result.copy()
+            result["heart_rate"] = self.locked_hr_value
+            return result
+
+    def _butter_bandpass_filter(self, data, lowcut=0.7, highcut=4.0, fs=30, order=5):
+        """带通滤波器，用于心率信号处理"""
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
+        b, a = butter(order, [low, high], btype='band')
+        y = filtfilt(b, a, data)
+        return y
+
+    def _update_hr_value(self):
+        """在子线程中计算心率"""
+        try:
+            if len(self.hr_signal_buffer) == HR_WINDOW_SIZE:
+                filtered = self._butter_bandpass_filter(self.hr_signal_buffer)
+                peaks, _ = find_peaks(filtered, distance=HR_FPS * 0.6)  # 至少间隔0.6秒
+
+                if len(peaks) >= 2:
+                    new_hr = 60 / (np.mean(np.diff(peaks)) / HR_FPS)
+                    self.hr_history.append(new_hr)
+
+                    # 平滑处理
+                    if len(self.hr_history) > HR_SMOOTHING_WINDOW:
+                        self.hr_history.pop(0)
+
+                    self.locked_hr_value = np.mean(self.hr_history)
+                    self.hr_display = f"HR: {self.locked_hr_value:.1f} BPM"
+        finally:
+            self.is_hr_calculating = False
+            self.last_hr_update_time = time.time()
+            self.hr_signal_buffer = []  # 重置缓冲区
+
+    def _collect_hr_data(self, frame):
+        """采集心率数据但不计算"""
+        if self.last_valid_face_rect and not self.is_hr_calculating:
+            x, y, w, h = self.last_valid_face_rect
+            # 使用面部中央区域提高稳定性
+            roi = frame[y + h // 4:y + h * 3 // 4, x + w // 4:x + w * 3 // 4]
+            self.hr_signal_buffer.append(np.mean(roi[:, :, 1]))  # 绿色通道
+
+            # 当缓冲区满且到5秒间隔时触发计算
+            current_time = time.time()
+            if (len(self.hr_signal_buffer) >= HR_WINDOW_SIZE and
+                    current_time - self.last_hr_update_time >= HR_UPDATE_INTERVAL):
+                self.is_hr_calculating = True
+                threading.Thread(target=self._update_hr_value, daemon=True).start()
 
     def _detection_loop(self, show_video: bool):
         last_detection_time = 0
         current_emotion = "neutral"
+
+        # 显示参数配置
+        font_scale = 0.6  # 字体大小
+        text_color = (0, 255, 0)  # 文字颜色(绿色)
+        text_thickness = 1  # 文字粗细
+        line_height = 25  # 行间距
+        start_y = 20  # 起始y坐标
+        text_x = 10  # 起始x坐标
 
         while self.is_running and self.cap is not None:
             ret, frame = self.cap.read()
@@ -141,10 +212,36 @@ class EmotionDetectorCamera:
             current_time = time.time()
             display_frame = frame.copy()
 
-            if self.last_valid_face_rect:
-                x, y, w, h = self.last_valid_face_rect
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # 1. 采集心率数据（每帧都执行）
+            self._collect_hr_data(frame)
 
+            # 2. 直接在画面上绘制信息（无背景条）
+            y_pos = display_frame.shape[0] - 80  # 从底部向上定位
+
+            # 第一行：表情
+            cv2.putText(display_frame, f"Emotion: {current_emotion}",
+                        (text_x, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+
+            # 第二行：心率（强制转换为整数）
+            hr_value = int(self.locked_hr_value) if self.locked_hr_value is not None else "Calculating"
+            cv2.putText(display_frame, f"Heart Rate: {hr_value}",
+                        (text_x, y_pos + line_height),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+
+            # 第三行：人口统计信息（如果有）
+            if self.demographics["age"] is not None:
+                demo_text = f"Age: {self.demographics['age']}  Gender: {self.demographics['gender']}"
+                cv2.putText(display_frame, demo_text,
+                            (text_x, y_pos + 2 * line_height),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+
+            # 3. 人脸检测和绘制
+            if self.last_valid_face_rect:
+                x, y, w_rect, h_rect = self.last_valid_face_rect
+                cv2.rectangle(display_frame, (x, y), (x + w_rect, y + h_rect), (0, 255, 0), 2)
+
+            # 4. 定时执行表情检测（保持原有逻辑）
             if current_time - last_detection_time >= self.detection_interval:
                 try:
                     cv2.imwrite(self.TEMP_IMG_PATH, frame)
@@ -161,7 +258,7 @@ class EmotionDetectorCamera:
                         self.last_valid_face_rect = (face_area["x"], face_area["y"], face_area["w"], face_area["h"])
 
                         face_img = frame[face_area["y"]:face_area["y"] + face_area["h"],
-                                         face_area["x"]:face_area["x"] + face_area["w"]]
+                                   face_area["x"]:face_area["x"] + face_area["w"]]
                         cv2.imwrite(self.TEMP_IMG_PATH, face_img)
 
                         if not self.demographics_initialized:
@@ -211,7 +308,8 @@ class EmotionDetectorCamera:
                                 "emotion_index": self.EMOTION_CLASSES.index(current_emotion.capitalize()) if current_emotion.capitalize() in self.EMOTION_CLASSES else 6,
                                 "probability": 1.0,
                                 "all_probabilities": {emo: 1.0 if emo.lower() == current_emotion.lower() else 0.0 for emo in self.emotion_classes},
-                                "timestamp": time.time()
+                                "timestamp": time.time(),
+                                "heart_rate": int(self.locked_hr_value) if self.locked_hr_value is not None else None
                             }
                             if self.callback:
                                 self.callback(self.latest_result)
@@ -226,20 +324,14 @@ class EmotionDetectorCamera:
                     if os.path.exists(self.TEMP_IMG_PATH):
                         os.remove(self.TEMP_IMG_PATH)
 
-            display_frame = self.show_text(display_frame, f"Emotion: {current_emotion}", (10, 30), (0, 255, 0), 0.9)
-
-            if self.last_valid_face_rect and self.demographics["age"] is not None:
-                x, y, w, h = self.last_valid_face_rect
-                gender_text = f"{self.demographics['gender']}"
-                display_frame = self.show_text(display_frame, f"Age: {self.demographics['age']}", (x, y - 50), (0, 255, 0), 0.6)
-                display_frame = self.show_text(display_frame, gender_text, (x, y - 20), (0, 255, 0), 0.6)
-
+            # 5. 显示画面
             if show_video:
-                cv2.imshow('Emotion Detection', display_frame)
+                cv2.imshow('Emotion & Heart Rate Detection', display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.is_running = False
                     break
 
+        # 清理资源
         if self.cap is not None:
             self.cap.release()
         if show_video:
@@ -247,17 +339,22 @@ class EmotionDetectorCamera:
 
 
 if __name__ == "__main__":
-    def print_emotion(result):
+    def print_result(result):
         print(f"\nDetection time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Emotion: {result['emotion']} (Confidence: {result['probability'] * 100:.2f}%)")
+        print(f"Emotion: {result['emotion']}")
+        if result.get('heart_rate') is not None:
+            print(f"Heart Rate: {result['heart_rate']:.1f} BPM")
+        else:
+            print("Heart Rate: Calculating...")
         print("Probabilities for all categories:")
         for emo, prob in result['all_probabilities'].items():
             print(f"  {emo}: {prob * 100:.2f}%")
 
+
     try:
         detector = EmotionDetectorCamera(
             detection_interval=0.5,
-            callback=print_emotion,
+            callback=print_result,
             use_chinese=False
         )
         if detector.start(show_video=True):
