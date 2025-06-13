@@ -7,6 +7,7 @@ Combines ASR, LLM, TTS, and Emotion detection components.
 """
 
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
 import argparse
 from dotenv import load_dotenv

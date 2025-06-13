@@ -400,18 +400,15 @@ class MedicalDiagnosisChatbot:
             with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
                     try:
-                        # Check if speech is ongoing - skip recording completely during TTS
-                        if self.is_speaking or (hasattr(self.tts, 'is_speaking') and self.tts.is_speaking):
-                            # Skip recording entirely during TTS playback to save resources
-                            print(f"DEBUG: Skipping recording - is_speaking: {self.is_speaking}, tts.is_speaking: {getattr(self.tts, 'is_speaking', False)}")
-                            time.sleep(0.2)  # Longer sleep during TTS
+                        # Check if speech is ongoing and should be interrupted
+                        if self.is_speaking:
+                            # Let the speech complete for medical consultation accuracy
+                            time.sleep(0.1)
                             continue
                         
-                        # Only start recording when not speaking
-                        print("DEBUG: Starting speech recognition...")
+                        # Recognize speech
                         result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
-                            print(f"Received user input: {result['text']}")
                             self.queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
@@ -440,39 +437,19 @@ class MedicalDiagnosisChatbot:
             Dict with speech result
         """
         try:
-            # Set the speaking flags FIRST, before any output or processing
+            # Set the speaking flag to prevent listening while speaking
             with self.lock:
                 self.is_speaking = True
-            print(f"DEBUG: Set is_speaking = True")
-            
-            # Also set the TTS speaking flag if it exists
-            if hasattr(self.tts, 'is_speaking'):
-                self.tts.is_speaking = True
-                print(f"DEBUG: Set tts.is_speaking = True")
-            
-            print(f"Speaking: {text}")
-            
-            # Small delay to ensure flags are set before any potential recording check
-            time.sleep(0.1)
                 
             # Speak the text
             result = self.tts.speak(text)
-            
-            # Add a delay to ensure audio finishes playing
-            time.sleep(0.3)
+            print(f"Speaking: {text[:50]}{'...' if len(text) > 50 else ''}")
                 
             return result
         finally:
-            # Make sure to reset both flags even if an error occurs
+            # Make sure to reset the flag even if an error occurs
             with self.lock:
                 self.is_speaking = False
-            print(f"DEBUG: Set is_speaking = False")
-            if hasattr(self.tts, 'is_speaking'):
-                self.tts.is_speaking = False
-                print(f"DEBUG: Set tts.is_speaking = False")
-            
-            # Small delay after clearing flags to ensure no immediate recording starts
-            time.sleep(0.1)
     
     def evaluate_condition(self, condition: str) -> bool:
         """Evaluate a condition string against the collected data
@@ -656,52 +633,38 @@ class MedicalDiagnosisChatbot:
             if extracted_data:
                 return extracted_data
             
-        # For chronic disease question
-        if current_topic["id"] == "T1-基础信息" and self.current_followup_index == 0:
-            extracted_data = {}
-            
-            # Check for chronic diseases
-            chronic_diseases = []
-            disease_keywords = {
-                "高血压": ["高血压", "血压高"],
-                "高血糖": ["高血糖", "糖尿病", "血糖高"],
-                "高血脂": ["高血脂", "血脂高"],
-                "胃病": ["胃病", "胃炎", "胃溃疡", "胃痛"]
-            }
-            
-            for disease, keywords in disease_keywords.items():
-                if any(keyword in response for keyword in keywords):
-                    chronic_diseases.append(disease)
-            
-            if chronic_diseases:
-                extracted_data["慢性病类型"] = "、".join(chronic_diseases)
+        # For gender confirmation question, extract gender directly
+        if current_topic["id"] == "T10-性别确认":
+            if "女" in response:
+                return {"gender": "female"}
+            elif "男" in response:
+                return {"gender": "male"}
             else:
-                extracted_data["慢性病类型"] = "无"
+                return {"gender": "unknown"}
+        
+        # Check for negations before checking for keywords
+        has_negation = any(neg in response for neg in ["没有", "不", "无", "不存在", "否认"])
+        
+        # For simple yes/no answers about symptoms, extract directly
+        if current_topic["id"] == "T2-发热寒热" and self.current_followup_index == -1:
+            # Process fever keywords, but check for negations first
+            if any(keyword in response for keyword in ["发烧", "发热"]) and not has_negation:
+                return {"是否发热": True}
+            elif any(keyword in response for keyword in ["发烧", "发热"]) and has_negation:
+                return {"是否发热": False}
+                
+            # Process cold sensitivity keywords
+            if any(keyword in response for keyword in ["怕冷", "畏寒"]) and not has_negation:
+                return {"是否怕冷": True}
+            elif any(keyword in response for keyword in ["怕冷", "畏寒"]) and has_negation:
+                return {"是否怕冷": False}
             
-            # Check for treatment
-            if "治疗" in response or "吃药" in response or "服药" in response:
-                extracted_data["治疗方式"] = "有治疗"
-            else:
-                extracted_data["治疗方式"] = "无治疗"
-            
-            # Check for drug allergies
-            if "过敏" in response or "过敏史" in response:
-                extracted_data["药物过敏"] = "有药物过敏"
-            else:
-                extracted_data["药物过敏"] = "无药物过敏"
-            
-            return extracted_data
-            
-        # For other topics with boolean questions - use pattern matching first
-        for topic_with_booleans in ["T2-发热寒热", "T3-头痛头晕", "T5-咽喉与咳嗽"]:
+        # For other topics with boolean questions
+        for topic_with_booleans in ["T3-头痛头晕", "T5-咽喉与咳嗽"]:
             if current_topic["id"] == topic_with_booleans and self.current_followup_index == -1:
-                extracted = self.extract_boolean_answers(response, current_topic["id"])
+                extracted = self.extract_boolean_answers(response, current_topic["id"], has_negation)
                 if extracted:
                     return extracted
-        
-        # For simple negation responses, return empty data quickly
-        if any(neg in response for neg in ["没有", "不", "无", "不存在", "否认", "没"]):
-            return {}
             
         # Determine which fields we need to extract
         if self.current_followup_index >= 0 and "follow_ups" in current_topic:
@@ -712,107 +675,81 @@ class MedicalDiagnosisChatbot:
         else:
             fields = current_topic["fields"]
             
-        # If no fields to extract, return empty
-        if not fields:
-            return {}
-            
-        # Only use LLM for complex extraction when we have specific fields to extract
-        # and the response seems to contain relevant information
-        relevant_keywords = ["疼", "痛", "不舒服", "难受", "症状", "感觉", "觉得", "有点", "很", "非常"]
-        if not any(keyword in response for keyword in relevant_keywords) and len(response.strip()) < 10:
-            # For short responses without medical keywords, likely no useful data
-            return {}
-        
-        # Create a simplified system prompt for faster processing
+        # Create a system prompt for the LLM to extract data
         system_prompt = (
-            "从患者回答中提取医疗信息。只提取与问题相关的信息。"
-            "对于布尔字段，回答True或False。对于其他字段，提供值或空字符串。"
-            "返回JSON格式，不要解释。"
+            "你是一个医疗问诊数据提取专家。你的任务是从患者回答中提取特定字段的信息。"
+            "对于每个字段，如果患者提供了相关信息，请提取出来。"
+            "对于布尔类型字段(是否XX)，请判断为True或False。"
+            "对于其他字段，请提供提取到的值或空字符串。"
+            "如果患者回答中包含否定词（如'没有'、'不'、'无'），请正确判断为False。"
+            "请以JSON格式返回结果，不要有任何多余文字。例如：\n"
+            "{\n"
+            "  \"是否头痛\": false,\n"
+            "  \"头痛部位\": \"\",\n"
+            "  \"是否发热\": true\n"
+            "}"
         )
         
-        # Create the extraction prompt with current question context
-        current_question = self.get_base_question()
-        extraction_prompt = (
-            f"问题：{current_question}\n"
-            f"回答：{response}\n"
-            f"提取字段：{fields}"
+        # Create the extraction prompt
+        extraction_prompt = f"患者的回答：\"{response}\"\n\n请从这个回答中提取以下字段的信息：{fields}"
+        
+        result = self.llm.generate_response(
+            user_input=extraction_prompt,
+            conversation_history=[{"role": "system", "content": system_prompt}]
         )
         
-        try:
-            result = self.llm.generate_response(
-                user_input=extraction_prompt,
-                conversation_history=[{"role": "system", "content": system_prompt}]
-            )
-            
-            extracted_data = {}
-            if result["success"]:
-                try:
-                    # Try to parse the JSON response
-                    # First find the JSON part in the response (it might have explanations)
-                    response_text = result["response"]
+        extracted_data = {}
+        if result["success"]:
+            try:
+                # Try to parse the JSON response
+                # First find the JSON part in the response (it might have explanations)
+                response_text = result["response"]
+                
+                # Look for JSON within the response
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = response_text[json_start:json_end]
+                    extracted_data = json.loads(json_str)
                     
-                    # Look for JSON within the response
-                    json_start = response_text.find("{")
-                    json_end = response_text.rfind("}") + 1
+                    # Convert string "True"/"False" to boolean values
+                    for key, value in extracted_data.items():
+                        if isinstance(value, str):
+                            if value.lower() == "true":
+                                extracted_data[key] = True
+                            elif value.lower() == "false":
+                                extracted_data[key] = False
+                            
+                    print(f"Extracted data: {extracted_data}")
+                else:
+                    # Fallback for non-JSON responses
+                    print("Could not find valid JSON in the response.")
                     
-                    if json_start >= 0 and json_end > json_start:
-                        json_str = response_text[json_start:json_end]
-                        extracted_data = json.loads(json_str)
-                        
-                        # Convert string "True"/"False" to boolean values
-                        for key, value in extracted_data.items():
-                            if isinstance(value, str):
-                                if value.lower() == "true":
-                                    extracted_data[key] = True
-                                elif value.lower() == "false":
-                                    extracted_data[key] = False
-                                
-                        print(f"Extracted data: {extracted_data}")
-                    else:
-                        # Fallback for non-JSON responses
-                        print("Could not find valid JSON in the response.")
-                        
-                except json.JSONDecodeError:
-                    print(f"Failed to parse JSON from response: {result['response']}")
-                except Exception as e:
-                    print(f"Error processing extraction result: {e}")
-        except Exception as e:
-            print(f"LLM extraction failed: {e}")
+            except json.JSONDecodeError:
+                print(f"Failed to parse JSON from response: {result['response']}")
+            except Exception as e:
+                print(f"Error processing extraction result: {e}")
         
         return extracted_data
     
-    def extract_boolean_answers(self, response: str, topic_id: str) -> Dict[str, Any]:
+    def extract_boolean_answers(self, response: str, topic_id: str, has_negation: bool = False) -> Dict[str, Any]:
         """Extract boolean answers for specific topics
         
         Args:
             response: The user's response text
             topic_id: The ID of the current topic
+            has_negation: Whether the response contains negation words
             
         Returns:
-            Dictionary of extracted boolean data
+            Dictionary of boolean field values
         """
         extracted = {}
         
-        # Check for negation words
-        has_negation = any(neg in response for neg in ["没有", "不", "无", "不存在", "否认", "没"])
-        
-        if topic_id == "T2-发热寒热":
-            # Fever and cold sensitivity keywords
-            fever_keywords = ["发烧", "发热", "体温高", "烧"]
-            cold_keywords = ["怕冷", "畏寒", "冷", "寒"]
-            
-            # Check for fever symptoms
-            if any(keyword in response for keyword in fever_keywords):
-                extracted["是否发热"] = not has_negation
-                
-            # Check for cold sensitivity symptoms  
-            if any(keyword in response for keyword in cold_keywords):
-                extracted["是否怕冷"] = not has_negation
-                
-        elif topic_id == "T3-头痛头晕":
-            # Headache and dizziness keywords
-            headache_keywords = ["头痛", "头疼", "脑袋疼", "脑袋痛"]
-            dizziness_keywords = ["头晕", "眩晕", "晕", "头昏"]
+        # Handle each topic specifically
+        if topic_id == "T3-头痛头晕":
+            headache_keywords = ["头痛", "头疼"]
+            dizziness_keywords = ["头晕", "天旋地转", "晕眩"]
             
             # Check for headache symptoms
             if any(keyword in response for keyword in headache_keywords):
@@ -823,9 +760,8 @@ class MedicalDiagnosisChatbot:
                 extracted["是否头晕"] = not has_negation
                 
         elif topic_id == "T5-咽喉与咳嗽":
-            # Cough and throat keywords
             cough_keywords = ["咳嗽", "咳", "咳痰"]
-            throat_keywords = ["嗓子", "咽喉", "喉咙", "咽部", "嗓子疼", "喉咙疼"]
+            throat_keywords = ["咽干", "喉咙痛", "喉咙干", "喉痛", "咽痛"]
             
             # Check for cough symptoms
             if any(keyword in response for keyword in cough_keywords):
@@ -836,7 +772,7 @@ class MedicalDiagnosisChatbot:
                 if not has_negation:
                     extracted["咽部不适"] = "有不适"
                 else:
-                    extracted["咽部不适"] = "无不适"
+                    extracted["咽部不适"] = ""
                 
         return extracted
     
@@ -862,8 +798,22 @@ class MedicalDiagnosisChatbot:
             if indicator in response:
                 return "male"
         
-        # For short responses or unclear cases, don't use LLM - just return unknown
-        # This avoids unnecessary delays
+        # If no clear indicators, use LLM to determine
+        system_prompt = "你是一个分析系统，需要从文本中判断说话者的性别。"
+        analysis_prompt = f"根据以下文本，判断说话者是男性还是女性（如果无法确定，请回答'未知'）：\n\n{response}"
+        
+        result = self.llm.generate_response(
+            user_input=analysis_prompt,
+            conversation_history=[{"role": "system", "content": system_prompt}]
+        )
+        
+        if result["success"]:
+            if "女" in result["response"]:
+                return "female"
+            elif "男" in result["response"]:
+                return "male"
+        
+        # Default if analysis fails
         return "unknown"
     
     def detect_gender(self, response: str) -> None:
@@ -873,7 +823,7 @@ class MedicalDiagnosisChatbot:
             response: Patient's response text
         """
         gender = self.extract_gender_from_response(response)
-        if gender != "unknown":
+        if gender:
             self.collected_data["gender"] = gender
             print(f"Detected gender: {gender}")
     
@@ -1320,14 +1270,6 @@ class MedicalDiagnosisChatbot:
             print(f"Current topic: {topic_name}, Follow-up index: {self.current_followup_index}")
             self.speak(question)
             
-            # Wait for TTS to completely finish before starting to listen
-            # This prevents recording during TTS playback
-            while self.is_speaking or (hasattr(self.tts, 'is_speaking') and self.tts.is_speaking):
-                time.sleep(0.1)
-            
-            # Add a small buffer to ensure audio output is completely finished
-            time.sleep(0.2)
-            
             # Add to conversation history
             self.conversation_history.append({"role": "assistant", "content": question})
             
@@ -1368,14 +1310,13 @@ class MedicalDiagnosisChatbot:
                 result["response"] = completion_message
                 result["consultation_complete"] = True
             else:
-                # Only give feedback if response is not relevant
+                # Give feedback based on relevance
                 if not self.response_relevant:
                     response_message = "您的回答可能与问题不太相关，让我们再试一次。"
-                    self.speak(response_message)
+                    #self.speak(response_message)
                     result["response"] = response_message
                 else:
-                    # Skip the "收到回答" message to reduce delay
-                    result["response"] = ""
+                    result["response"] = "收到您的回答，继续下一个问题。"
             
             # Success
             result["success"] = True
@@ -1399,13 +1340,15 @@ class MedicalDiagnosisChatbot:
         print("Starting Medical Diagnosis Chatbot with logical flow control...")
         print(f"Say '{exit_phrase}' to end consultation.")
         
-        # Start the listening thread FIRST but it will wait for TTS to finish
-        print("Starting listening thread...")
+        # Start the listening thread
         self.listen_thread.start()
         
-        # Initial greeting - speak AFTER starting the listening thread
+        # Initial greeting
         greeting = "您好，我是您的智能问诊助手。接下来我会通过提问来了解您的健康状况，这样能帮助医生更好地了解您的情况。准备好了吗？我们开始第一个问题。"
         self.speak(greeting)
+        
+        # Wait for a moment to let the greeting sink in
+        time.sleep(1)
         
         running = True
         consultation_summary = None
@@ -1432,8 +1375,8 @@ class MedicalDiagnosisChatbot:
             if result["user_input"] and exit_phrase in result["user_input"]:
                 running = False
             
-            # Remove the fixed delay between interactions
-            # time.sleep(0.25)  # Removed this line
+            # Brief pause between interactions
+            time.sleep(0.25)
         
         print("Medical consultation completed.")
         self.cleanup()
@@ -1454,71 +1397,29 @@ class MedicalDiagnosisChatbot:
         Returns:
             Boolean indicating if the response is relevant
         """
-        # Skip LLM check for empty or very short responses
-        if not response or len(response.strip()) < 2:
-            return False
-            
-        # For most common medical responses, skip LLM check
-        common_relevant_patterns = [
-            # Negation patterns - always relevant
-            "没有", "不", "无", "不存在", "否认", "没", "不会", "不是",
-            # Affirmation patterns - always relevant  
-            "有", "是", "会", "对", "嗯", "好", "可以", "行",
-            # Medical terms - always relevant
-            "疼", "痛", "不舒服", "难受", "症状", "感觉", "觉得",
-            "头", "胃", "肚子", "腹", "胸", "背", "腰", "腿", "手", "脚",
-            "发烧", "发热", "咳嗽", "头痛", "头晕", "恶心", "呕吐",
-            "高血压", "糖尿病", "胃病", "过敏", "治疗", "吃药", "服药",
-            # Age and gender patterns
-            "岁", "年", "男", "女", "性别",
-            # Time patterns
-            "天", "小时", "分钟", "昨天", "今天", "最近", "刚才", "现在",
-            # Degree patterns
-            "很", "非常", "特别", "比较", "有点", "稍微", "轻微", "严重"
-        ]
-        
-        # Check if response contains any relevant patterns
-        if any(pattern in response for pattern in common_relevant_patterns):
-            return True
-            
-        # For basic information questions, be more lenient
-        current_topic = self.get_current_topic()
-        if current_topic and current_topic["id"] == "T1-基础信息":
-            # For basic info, almost any response is relevant
-            if len(response.strip()) >= 1:
-                return True
-        
-        # For very short responses that might be relevant
-        if len(response.strip()) <= 5:
-            # Short responses like "嗯", "好", "对" are usually relevant
-            return True
-            
-        # Only use LLM for complex cases that we can't determine with patterns
-        # This should be rare now
         current_question = self.get_base_question()
         
-        # Create a simplified system prompt for faster processing
+        # Create a system prompt for relevance check
         system_prompt = (
-            "判断患者回答是否与问题相关。只回答'相关'或'不相关'，不要解释。"
+            "你是一个医疗问诊对话分析专家。你的任务是判断患者的回答是否与当前问题相关。"
+            "请分析患者回答的内容是否针对了问题所问的方面，即使回答是'没有'也算相关。"
+            "如果回答完全不相关或答非所问，请返回'不相关'，否则返回'相关'。"
         )
         
-        # Create a simplified check prompt
+        # Create the relevance check prompt
         check_prompt = (
-            f"问题：{current_question}\n"
-            f"回答：{response}\n"
-            f"相关吗？"
+            f"当前问题：\"{current_question}\"\n\n"
+            f"患者回答：\"{response}\"\n\n"
+            f"请判断患者回答是否与当前问题相关？"
         )
         
-        try:
-            result = self.llm.generate_response(
-                user_input=check_prompt,
-                conversation_history=[{"role": "system", "content": system_prompt}]
-            )
-            
-            if result["success"]:
-                return "相关" in result["response"] and "不相关" not in result["response"]
-        except Exception as e:
-            print(f"LLM relevance check failed: {e}")
+        result = self.llm.generate_response(
+            user_input=check_prompt,
+            conversation_history=[{"role": "system", "content": system_prompt}]
+        )
+        
+        if result["success"]:
+            return "相关" in result["response"] and "不相关" not in result["response"]
         
         # Default to assuming the response is relevant if LLM call fails
         return True

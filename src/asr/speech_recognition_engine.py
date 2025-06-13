@@ -43,11 +43,11 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         self.timeout = timeout
         self.phrase_time_limit = phrase_time_limit if phrase_time_limit else 30
         
-        # Set recording parameters
-        self.sample_rate = 16000  # sampling rate (Hz)
-        self.channels = 1  # mono channel
-        self.FORMAT = pyaudio.paInt16  # data type
-        self.block_size = 3200  # number of frames per buffer
+        # Optimize recording parameters
+        self.sample_rate = 16000
+        self.channels = 1
+        self.FORMAT = pyaudio.paInt16
+        self.block_size = 800  # Reduced from 3200 for faster processing
         
         # Global variables for mic and stream
         self.mic = None
@@ -59,11 +59,26 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         # Initialize recorder
         self.recognition = None
         
-        # Set model based on language
-        self.model = 'paraformer-realtime-v2'
+        # Use lighter model for lower latency
+        self.model = 'paraformer-realtime-v1'  # Changed from v2 to v1
         print(f"Using Dashscope ASR model: {self.model}")
         
         self.audio_manager = get_audio_manager()
+        
+        # Audio preprocessing buffer
+        self.audio_buffer = []
+        self.buffer_size = 4  # Number of blocks to buffer before processing
+        
+        # Optimized silence detection parameters
+        self.silence_threshold = 150  # Reduced from 180 for better sensitivity
+        self.silence_time_to_stop = 0.2  # Reduced from 0.3 for faster response
+        self.min_speech_duration = 0.1  # Minimum duration of speech to consider
+        self.max_silence_duration = 1.0  # Maximum silence duration before stopping
+        self.speech_detected = False
+        self.last_speech_time = None
+        
+        # Recording indicator control
+        self.recording_active = False
         
     def init_dashscope_api_key(self):
         """Set Dashscope API key from environment variable or config file"""
@@ -135,7 +150,6 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             print(result["error"])
             return result
         
-        # Store the final recognized text (not intermediate results)
         final_text = ""
         current_sentence = ""
         if not hasattr(self, "_mic"):
@@ -147,29 +161,30 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
                 rate=16000,
                 block_size=self.block_size
             )
-        # Real-time speech recognition callback
+            
         class Callback(RecognitionCallback):
+            def __init__(self):
+                self.text = ""
+                self.stream = None
+                self.is_final = False
+                self.sentence_ended = False
+                self.last_text_time = time.time()
+                
             def on_open(self) -> None:
                 print('RecognitionCallback open.')
-
+                
             def on_close(self) -> None:
                 print('RecognitionCallback close.')
-                # if hasattr(self, 'stream') and self.stream:
-                #     self.stream.stop_stream()
-                #     self.stream.close()
-                # if hasattr(self, 'mic') and self.mic:
-                #     self.mic.terminate()
-                # self.stream = None
-                # self.mic = None
-
+                
             def on_complete(self) -> None:
                 print('RecognitionCallback completed.')
-
+                self.is_final = True
+                
             def on_error(self, message) -> None:
                 print('RecognitionCallback task_id: ', message.request_id)
                 print('RecognitionCallback error: ', message.message)
                 result["error"] = f"Recognition error: {message.message}"
-
+                
             def on_event(self, result_obj) -> None:
                 nonlocal final_text, current_sentence
                 try:
@@ -177,25 +192,40 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
                     if 'text' in sentence:
                         text = sentence['text']
                         print('RecognitionCallback text: ', text)
-                        
-                        # Update the current sentence with the latest result
                         current_sentence = text
+                        self.last_text_time = time.time()
                         
-                        # Check for sentence end status directly rather than using is_sentence_end
+                        # Only check for truly complete short responses (not partial ones)
+                        truly_complete_responses = [
+                            "没有", "有", "是的", "不是", "对的", "不对", "好的", "不好", "嗯"
+                        ]
+                        
+                        # Check for incomplete indicators that suggest more is coming
+                        incomplete_indicators = [
+                            "但是", "不过", "然后", "还有", "另外", "而且", "所以", "因为", 
+                            "，", "。但", "。不", "。还", "。另", "。而", "。所", "。因"
+                        ]
+                        
+                        # Only mark as complete if it's a truly complete response AND doesn't have incomplete indicators
+                        if (any(resp == text.strip() for resp in truly_complete_responses) and
+                            not any(indicator in text for indicator in incomplete_indicators)):
+                            if len(text.strip()) <= 5:  # Very short and complete
+                                print(f"Detected truly complete short response: '{text}'")
+                                self.sentence_ended = True
+                        
                         if 'status_text' in sentence and sentence['status_text'] == 'SENTENCE_END':
                             print(f'RecognitionCallback sentence end: "{text}"')
-                            # Add the completed sentence to final text only when sentence is complete
                             if final_text and not final_text.endswith(("。", ".", "!", "?", "！", "？")):
                                 final_text += " "
                             final_text += text
+                            self.sentence_ended = True
                 except Exception as e:
                     print(f"Error processing recognition result: {e}")
-        
-        # Create the callback
+                
         callback = Callback()
         callback.stream = self._mic_stream
+        
         try:
-            # Call recognition service in async mode
             recognition = Recognition(
                 model=self.model,
                 format='pcm',
@@ -203,87 +233,132 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
                 semantic_punctuation_enabled=True,
                 callback=callback)
             
-            # Start recognition
             recognition.start()
             
             print("Recording... (speak now)")
             print("This will automatically detect speech and stop after a pause.")
             print("Press Ctrl+C to stop manually.")
             
-            # Show recording indicator
+            # Start recording indicator with proper control
+            self.recording_active = True
             recording_indicator_thread = threading.Thread(target=self._show_recording_indicator)
             recording_indicator_thread.daemon = True
             recording_indicator_thread.start()
             
-            # Record for a maximum of phrase_time_limit seconds
             start_time = time.time()
             silence_start = None
             silence_duration = 0
-            silence_threshold = 200  # Adjusted silence detection (higher = less sensitive)
-            silence_time_to_stop = 0.5  # Silence duration required to stop recording (reduced from 5s to 2s)
+            speech_start = None
+            speech_detected = False
+            consecutive_silence_blocks = 0
+            max_silence_blocks = int(self.max_silence_duration * self.sample_rate / self.block_size)
             
             try:
-                # Continue until timeout or silence detected
                 while time.time() - start_time < self.phrase_time_limit:
-                    # Check if stream is available
+                    # Check multiple completion conditions
+                    if callback.is_final or callback.sentence_ended:
+                        print("\nRecognition completed, stopping early.")
+                        break
+                    
+                    # Check if we have text but no new text for a longer while (increased time)
+                    if (current_sentence and 
+                        time.time() - callback.last_text_time > 2.0):  # Increased from 0.8
+                        print("\nNo new text received, assuming completion.")
+                        break
+                    
+                    # More conservative check for short complete responses
+                    if current_sentence:
+                        # Only stop for very specific complete responses
+                        definite_complete = ["没有", "有", "嗯", "好"]
+                        incomplete_signs = ["但是", "不过", "然后", "还有", "另外", "而且", "所以", "因为", "，", "。"]
+                        
+                        # Only stop if it's definitely complete AND no incomplete signs
+                        if (any(resp == current_sentence.strip() for resp in definite_complete) and
+                            not any(sign in current_sentence for sign in incomplete_signs)):
+                            # Wait longer to be sure
+                            if time.time() - callback.last_text_time > 1.0:  # Increased from 0.3
+                                print(f"\nDetected complete short response: '{current_sentence}', stopping.")
+                                break
+                        
                     if hasattr(callback, 'stream') and callback.stream:
-                        # Read audio data
                         data = callback.stream.read(self.block_size, exception_on_overflow=False)
                         
-                        # Send to recognition service
-                        recognition.send_audio_frame(data)
+                        # Convert audio data to numpy array for processing
+                        audio_data = np.frombuffer(data, dtype=np.int16)
                         
-                        # Calculate audio energy level for silence detection
-                        rms = sum(abs(int.from_bytes(data[i:i+2], byteorder='little', signed=True)) 
-                                for i in range(0, len(data), 2)) / (len(data)/2)
+                        # Calculate audio energy level
+                        rms = np.sqrt(np.mean(np.square(audio_data.astype(np.float32))))
                         
-                        # Check for silence
-                        if rms < silence_threshold:
-                            if silence_start is None:
-                                silence_start = time.time()
-                            silence_duration = time.time() - silence_start
-                            if silence_duration > silence_time_to_stop:
-                                print("\nSpeech ended due to silence detection.")
-                                break
-                        else:
-                            # Reset silence detection if sound detected
+                        # Speech detection logic
+                        if rms >= self.silence_threshold:
+                            if not speech_detected:
+                                speech_start = time.time()
+                                speech_detected = True
                             silence_start = None
                             silence_duration = 0
+                            consecutive_silence_blocks = 0
+                            self.last_speech_time = time.time()
+                        else:
+                            if speech_detected:
+                                if silence_start is None:
+                                    silence_start = time.time()
+                                silence_duration = time.time() - silence_start
+                                consecutive_silence_blocks += 1
+                                
+                                # More conservative stopping conditions
+                                if current_sentence and len(current_sentence.strip()) >= 2:
+                                    # Check for incomplete indicators before stopping
+                                    incomplete_signs = ["但是", "不过", "然后", "还有", "另外", "而且", "所以", "因为", "，"]
+                                    
+                                    # If text contains incomplete indicators, wait longer
+                                    if any(sign in current_sentence for sign in incomplete_signs):
+                                        required_silence = 1.5  # Wait longer for incomplete sentences
+                                    else:
+                                        required_silence = 0.8  # Normal wait time
+                                    
+                                    if silence_duration > required_silence:
+                                        print(f"\nSpeech ended due to silence after getting text: '{current_sentence}'")
+                                        break
+                                
+                                # Original stopping conditions for longer responses
+                                if ((silence_duration > self.silence_time_to_stop and 
+                                     speech_start and (time.time() - speech_start) >= self.min_speech_duration) or
+                                    consecutive_silence_blocks >= max_silence_blocks):
+                                    print("\nSpeech ended due to silence detection.")
+                                    break
+                        
+                        # Send audio frame to recognition service
+                        recognition.send_audio_frame(data)
                     else:
-                        # Wait for the stream to be initialized
-                        time.sleep(0.1)
+                        time.sleep(0.05)  # Reduced sleep time for faster response
                         
             except KeyboardInterrupt:
                 print("\nStopped recording due to user interrupt.")
             
-            # Stop recognition
-            recognition.stop()
+            # Stop recording indicator
+            self.recording_active = False
             
-            # Wait a brief moment for final processing
-            time.sleep(0.25)
-            timestamp = datetime.now().timestamp()
-            logging.info(f"after recognition:{timestamp}")
-            # Use the final text if available, otherwise use current sentence
+            recognition.stop()
+            time.sleep(0.1)  # Brief wait for cleanup
+            
+            # Clear the recording indicator line
+            print("\r" + " " * 50 + "\r", end="")
+            
             recognized_text = final_text if final_text else current_sentence
             
-            # Update result
             if recognized_text:
                 result["text"] = recognized_text.strip()
                 result["success"] = True
-                print(f"\nDashscope recognized: {recognized_text}")
+                print(f"Dashscope recognized: {recognized_text}")
             else:
                 result["error"] = "No speech detected or recognized"
-                print("\nNo speech detected or recognized.")
+                print("No speech detected or recognized.")
         
         except Exception as e:
+            # Make sure to stop recording indicator on error
+            self.recording_active = False
             result["error"] = f"Error during speech recognition: {e}"
             print(f"\nError during Dashscope speech recognition: {e}")
-            # Use simulated response as fallback
-            #sim_result = self._get_simulated_response()
-            # result["text"] = sim_result["text"]
-            # result["success"] = True
-            # result["engine"] = "simulation_fallback"
-            # print(f"Using simulated response: {sim_result['text']}")
         
         return result
     
@@ -291,7 +366,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         """Show a simple recording indicator in the console"""
         indicators = ["🎙️ ", "🎙️  .", "🎙️  ..", "🎙️  ..."]
         i = 0
-        while True:
+        while self.recording_active:
             print(f"\rRecording {indicators[i % len(indicators)]}", end="")
             i += 1
             time.sleep(0.25)

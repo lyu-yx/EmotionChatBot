@@ -42,7 +42,8 @@ class EmotionAwareStreamingChatbot:
                  use_text_emotion: bool = USE_TEXT_EMOTION_DETECTION,
                  use_camera_emotion: bool = USE_CAMERA_EMOTION_DETECTION,
                  camera_id: int = 0,
-                 show_camera: bool = False):
+                 show_camera: bool = False,
+                 reference_img_path: Optional[str] = None):
         """Initialize the emotion-aware streaming chatbot
 
         Args:
@@ -56,6 +57,7 @@ class EmotionAwareStreamingChatbot:
             use_camera_emotion: Whether to use camera-based emotion detection
             camera_id: Camera ID to use for emotion detection
             show_camera: Whether to show camera feed
+            reference_img_path: Path to reference image for face verification
         """
         # Default system prompt if not provided
         if system_prompt is None:
@@ -118,7 +120,8 @@ class EmotionAwareStreamingChatbot:
                 self.camera_detector = EmotionDetectorCamera(
                     detection_interval=0.5,  # Check emotion every half second
                     use_chinese=use_chinese,
-                    callback=on_camera_emotion_detected
+                    callback=on_camera_emotion_detected,
+                    reference_img_path=reference_img_path
                 )
 
                 # Start the camera detection

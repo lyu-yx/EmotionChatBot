@@ -8,7 +8,9 @@ Combines ASR, LLM, TTS, and Emotion detection components.
 
 import os
 import sys
+import time
 import argparse
+import traceback
 from dotenv import load_dotenv
 
 # Import our component classes directly
@@ -18,6 +20,7 @@ from src.llm.language_model import StreamingLanguageModel
 from src.tts.speech_synthesis import StreamingTTSSynthesizer
 from src.emotion.emotion_detector import DashscopeEmotionDetector, TextBasedEmotionDetector
 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 def init_api_key():
     """Initialize API key from environment variables or config file"""
@@ -74,6 +77,8 @@ def main():
                         help="Camera ID to use for emotion detection (default: 0)")
     emotion_group.add_argument("--show-camera", action="store_true",default = True,
                         help="Show camera feed window (default: hidden)")
+    emotion_group.add_argument("--ref-img", type=str, default="refimg/LyuYixuan.jpg",
+                        help="Path to the reference image for face verification.")
     
     # Wake word and activation settings
     wake_group = parser.add_argument_group('Wake Word')
@@ -150,7 +155,8 @@ def main():
         use_text_emotion=args.text_emotion,
         use_camera_emotion=args.camera_emotion,
         camera_id=args.camera_id,
-        show_camera=args.show_camera
+        show_camera=args.show_camera,
+        reference_img_path=args.ref_img
     )
     
     # Run the chatbot

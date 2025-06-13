@@ -25,6 +25,9 @@ deepface>=0.0.75
 
 # Machine learning
 torch>=2.1.0
+torchvision>=0.15.0
+tf-keras>=2.14.0
+scipy>=1.10.0
 huggingface-hub>=0.17.3
 datasets>=2.14.0
 tokenizers>=0.14.1

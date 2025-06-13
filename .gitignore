@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 venv/*
 src/emotion/shape_predictor_68_face_landmarks.dat
+*.jpg
+*.zip
+*.env
+video/*

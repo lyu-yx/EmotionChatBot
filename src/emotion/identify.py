@@ -58,7 +58,8 @@ class EmotionDetectorCamera:
     def __init__(self,
                  detection_interval: float = 0.5,
                  use_chinese: bool = False,
-                 callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+                 callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 reference_img_path: Optional[str] = None):
 
         self.detection_interval = detection_interval
         self.callback = callback
@@ -91,6 +92,42 @@ class EmotionDetectorCamera:
         self.last_valid_face_rect = None
         self.demographics = {"age": None, "gender": None, "gender_confidence": None}
         self.demographics_initialized = False
+
+        # 人脸验证相关
+        self.reference_img_path = reference_img_path
+        self.verification_result = None
+        self.ALIGNED_REF_IMG_PATH = "aligned_ref_img.jpg"
+
+        # 异步处理锁
+        self.processing_lock = threading.Lock()
+        self.last_demographics_time = 0
+
+        if self.reference_img_path:
+            if not os.path.exists(self.reference_img_path):
+                print(f"警告：在路径 {self.reference_img_path} 未找到参考图像")
+                self.reference_img_path = None
+            else:
+                # 对参考图像进行人脸对齐并保存
+                try:
+                    print("正在处理参考图像以进行对齐...")
+                    ref_face_objs = DeepFace.extract_faces(
+                        img_path=self.reference_img_path,
+                        detector_backend="ssd",
+                        enforce_detection=True,
+                        align=True
+                    )
+                    if ref_face_objs:
+                        main_ref_face = max(ref_face_objs, key=lambda x: x["facial_area"]["w"] * x["facial_area"]["h"])
+                        aligned_ref_face_float = main_ref_face['face']
+                        aligned_ref_face_img = (aligned_ref_face_float * 255).astype(np.uint8)
+                        cv2.imwrite(self.ALIGNED_REF_IMG_PATH, aligned_ref_face_img)
+                        print(f"参考图像已对齐并保存到 {self.ALIGNED_REF_IMG_PATH}")
+                    else:
+                        print(f"警告：在参考图像 {self.reference_img_path} 中未检测到人脸。")
+                        self.reference_img_path = None
+                except Exception as e:
+                    print(f"处理参考图像时出错：{e}")
+                    self.reference_img_path = None
 
     def show_text(self, frame, text, position=(50, 50), color=(0, 255, 0), size=1.0):
         if self.emotion_classes == self.EMOTION_CLASSES_ZH:
@@ -137,6 +174,10 @@ class EmotionDetectorCamera:
         if self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
+        if os.path.exists(self.TEMP_IMG_PATH):
+            os.remove(self.TEMP_IMG_PATH)
+        if os.path.exists(self.ALIGNED_REF_IMG_PATH):
+            os.remove(self.ALIGNED_REF_IMG_PATH)
         print("Emotion detection stopped")
 
     def get_latest_emotion(self) -> Dict[str, Any]:
@@ -193,15 +234,12 @@ class EmotionDetectorCamera:
 
     def _detection_loop(self, show_video: bool):
         last_detection_time = 0
-        current_emotion = "neutral"
 
-        # 显示参数配置
-        font_scale = 0.6  # 字体大小
-        text_color = (0, 255, 0)  # 文字颜色(绿色)
-        text_thickness = 1  # 文字粗细
-        line_height = 25  # 行间距
-        start_y = 20  # 起始y坐标
-        text_x = 10  # 起始x坐标
+        font_scale = 0.6
+        text_color = (0, 255, 0)
+        text_thickness = 1
+        line_height = 25
+        text_x = 10
 
         while self.is_running and self.cap is not None:
             ret, frame = self.cap.read()
@@ -212,130 +250,144 @@ class EmotionDetectorCamera:
             current_time = time.time()
             display_frame = frame.copy()
 
-            # 1. 采集心率数据（每帧都执行）
             self._collect_hr_data(frame)
 
-            # 2. 直接在画面上绘制信息（无背景条）
-            y_pos = display_frame.shape[0] - 80  # 从底部向上定位
+            with self.lock:
+                latest_result_copy = self.latest_result.copy()
+                verification_result_copy = self.verification_result
 
-            # 第一行：表情
-            cv2.putText(display_frame, f"Emotion: {current_emotion}",
-                        (text_x, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
-
-            # 第二行：心率（强制转换为整数）
+            current_emotion = latest_result_copy.get("emotion", "neutral")
+            age = latest_result_copy.get("age")
+            gender = latest_result_copy.get("gender")
             hr_value = int(self.locked_hr_value) if self.locked_hr_value is not None else "Calculating"
-            cv2.putText(display_frame, f"Heart Rate: {hr_value}",
-                        (text_x, y_pos + line_height),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
 
-            # 第三行：人口统计信息（如果有）
-            if self.demographics["age"] is not None:
-                demo_text = f"Age: {self.demographics['age']}  Gender: {self.demographics['gender']}"
-                cv2.putText(display_frame, demo_text,
-                            (text_x, y_pos + 2 * line_height),
+            y_pos = display_frame.shape[0] - 80
+            cv2.putText(display_frame, f"Emotion: {current_emotion}", (text_x, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+            cv2.putText(display_frame, f"Heart Rate: {hr_value}", (text_x, y_pos + line_height),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+            if age is not None:
+                demo_text = f"Age: {age}  Gender: {gender}"
+                cv2.putText(display_frame, demo_text, (text_x, y_pos + 2 * line_height),
                             cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
 
-            # 3. 人脸检测和绘制
             if self.last_valid_face_rect:
                 x, y, w_rect, h_rect = self.last_valid_face_rect
                 cv2.rectangle(display_frame, (x, y), (x + w_rect, y + h_rect), (0, 255, 0), 2)
 
-            # 4. 定时执行表情检测（保持原有逻辑）
+            if verification_result_copy and verification_result_copy["verified"]:
+                ref_img_name = os.path.basename(self.reference_img_path)
+                distance = verification_result_copy['distance']
+                verify_text = f"{ref_img_name} (Distance: {distance:.2f})"
+                frame_h, _, _ = display_frame.shape
+                cv2.putText(display_frame, verify_text, (10, frame_h - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), text_thickness)
+
             if current_time - last_detection_time >= self.detection_interval:
-                try:
-                    cv2.imwrite(self.TEMP_IMG_PATH, frame)
-                    face_objs = DeepFace.extract_faces(
-                        img_path=self.TEMP_IMG_PATH,
-                        detector_backend="ssd",
-                        enforce_detection=False,
-                        align=False
-                    )
+                if self.processing_lock.acquire(blocking=False):
+                    last_detection_time = current_time
+                    worker_thread = threading.Thread(target=self._process_frame_worker, args=(frame.copy(),), daemon=True)
+                    worker_thread.start()
 
-                    if face_objs:
-                        main_face = max(face_objs, key=lambda x: x["facial_area"]["w"] * x["facial_area"]["h"])
-                        face_area = main_face["facial_area"]
-                        self.last_valid_face_rect = (face_area["x"], face_area["y"], face_area["w"], face_area["h"])
-
-                        face_img = frame[face_area["y"]:face_area["y"] + face_area["h"],
-                                   face_area["x"]:face_area["x"] + face_area["w"]]
-                        cv2.imwrite(self.TEMP_IMG_PATH, face_img)
-
-                        if not self.demographics_initialized:
-                            results = DeepFace.analyze(
-                                img_path=self.TEMP_IMG_PATH,
-                                actions=["emotion", "age", "gender"],
-                                detector_backend="skip",
-                                enforce_detection=False,
-                                silent=True
-                            )
-                            if results:
-                                r = results[0]
-                                self.demographics["age"] = int(r["age"])
-                                self.demographics["gender"] = r["dominant_gender"]
-                                self.demographics["gender_confidence"] = r["gender"][r["dominant_gender"]]
-                                self.demographics_initialized = True
-
-                                raw_emotions = r["emotion"]
-                                biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
-                                emotion_window.append(biased_emotions)
-                                current_emotion = max(biased_emotions, key=biased_emotions.get)
-                        else:
-                            results = DeepFace.analyze(
-                                img_path=self.TEMP_IMG_PATH,
-                                actions=["emotion"],
-                                detector_backend="skip",
-                                enforce_detection=False,
-                                silent=True
-                            )
-                            if results:
-                                raw_emotions = results[0]["emotion"]
-                                biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
-                                emotion_window.append(biased_emotions)
-
-                                combined_scores = {}
-                                for e in emotion_window:
-                                    for emo, score in e.items():
-                                        combined_scores[emo] = combined_scores.get(emo, 0) + score
-                                for emo in combined_scores:
-                                    combined_scores[emo] /= len(emotion_window)
-
-                                current_emotion = max(combined_scores, key=combined_scores.get)
-
-                        with self.lock:
-                            self.latest_result = {
-                                "emotion": current_emotion,
-                                "emotion_index": self.EMOTION_CLASSES.index(current_emotion.capitalize()) if current_emotion.capitalize() in self.EMOTION_CLASSES else 6,
-                                "probability": 1.0,
-                                "all_probabilities": {emo: 1.0 if emo.lower() == current_emotion.lower() else 0.0 for emo in self.emotion_classes},
-                                "timestamp": time.time(),
-                                "heart_rate": int(self.locked_hr_value) if self.locked_hr_value is not None else None
-                            }
-                            if self.callback:
-                                self.callback(self.latest_result)
-
-                        last_detection_time = current_time
-
-                    if os.path.exists(self.TEMP_IMG_PATH):
-                        os.remove(self.TEMP_IMG_PATH)
-
-                except Exception as e:
-                    print(f"检测失败: {e}")
-                    if os.path.exists(self.TEMP_IMG_PATH):
-                        os.remove(self.TEMP_IMG_PATH)
-
-            # 5. 显示画面
             if show_video:
                 cv2.imshow('Emotion & Heart Rate Detection', display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.is_running = False
                     break
-
-        # 清理资源
+        
         if self.cap is not None:
             self.cap.release()
         if show_video:
             cv2.destroyAllWindows()
+
+    def _process_frame_worker(self, frame: np.ndarray):
+        try:
+            temp_img_path = f"temp_frame_{threading.get_ident()}.jpg"
+            cv2.imwrite(temp_img_path, frame)
+
+            face_objs = DeepFace.extract_faces(
+                img_path=temp_img_path,
+                detector_backend="centerface",
+                enforce_detection=False,
+                align=True
+            )
+
+            if face_objs:
+                main_face = max(face_objs, key=lambda x: x["facial_area"]["w"] * x["facial_area"]["h"])
+                
+                with self.lock:
+                    face_area = main_face["facial_area"]
+                    self.last_valid_face_rect = (face_area["x"], face_area["y"], face_area["w"], face_area["h"])
+
+                aligned_face_img_float = main_face['face']
+                aligned_face_img = (aligned_face_img_float * 255).astype(np.uint8)
+                cv2.imwrite(temp_img_path, aligned_face_img)
+
+                local_verification_result = None
+                if self.reference_img_path:
+                    try:
+                        local_verification_result = DeepFace.verify(
+                            img1_path=temp_img_path,
+                            img2_path=self.ALIGNED_REF_IMG_PATH,
+                            model_name="VGG-Face", detector_backend="centerface", enforce_detection=False
+                        )
+                    except Exception as e:
+                        pass 
+
+                current_time = time.time()
+                actions_to_perform = ["emotion"]
+                if current_time - self.last_demographics_time >= 5.0:
+                    actions_to_perform.extend(["age", "gender"])
+
+                results = DeepFace.analyze(
+                    img_path=temp_img_path, actions=actions_to_perform,
+                    detector_backend="centerface", enforce_detection=False, silent=True
+                )
+                
+                current_emotion = "neutral"
+                if results:
+                    r = results[0]
+                    if "age" in r:
+                        self.demographics["age"] = int(r["age"])
+                        self.demographics["gender"] = r["dominant_gender"]
+                        self.demographics["gender_confidence"] = r["gender"][r["dominant_gender"]]
+                        self.last_demographics_time = current_time
+
+                    raw_emotions = r["emotion"]
+                    biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
+                    emotion_window.append(biased_emotions)
+                    
+                    combined_scores = {}
+                    for e in emotion_window:
+                        for emo, score in e.items():
+                            combined_scores[emo] = combined_scores.get(emo, 0) + score
+                    for emo in combined_scores:
+                        combined_scores[emo] /= len(emotion_window)
+                    current_emotion = max(combined_scores, key=combined_scores.get)
+                
+                with self.lock:
+                    self.verification_result = local_verification_result
+                    self.latest_result = {
+                        "emotion": current_emotion,
+                        "emotion_index": self.EMOTION_CLASSES.index(current_emotion.capitalize()) if current_emotion.capitalize() in self.EMOTION_CLASSES else 6,
+                        "probability": 1.0,
+                        "all_probabilities": {emo: 1.0 if emo.lower() == current_emotion.lower() else 0.0 for emo in self.emotion_classes},
+                        "timestamp": time.time(),
+                        "heart_rate": int(self.locked_hr_value) if self.locked_hr_value is not None else None,
+                        "age": self.demographics["age"],
+                        "gender": self.demographics["gender"]
+                    }
+                    if self.callback:
+                        self.callback(self.latest_result)
+
+            if os.path.exists(temp_img_path):
+                os.remove(temp_img_path)
+
+        except Exception as e:
+            # print(f"检测线程失败: {e}")
+            pass
+        finally:
+            self.processing_lock.release()
 
 
 if __name__ == "__main__":
@@ -355,7 +407,8 @@ if __name__ == "__main__":
         detector = EmotionDetectorCamera(
             detection_interval=0.5,
             callback=print_result,
-            use_chinese=False
+            use_chinese=False,
+            reference_img_path="refimg/LyuYixuan.jpg"
         )
         if detector.start(show_video=True):
             print("Press 'q' to stop detection")
