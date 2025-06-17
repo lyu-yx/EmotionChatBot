@@ -325,8 +325,8 @@ class StreamingTTSSynthesizer(TextToSpeech):
                     print(f"Error in streaming_call: {e}")
                     continue
             # Signal completion
-            timestamp = datetime.now().timestamp()
-            logging.info(f"time before speaking:{timestamp}")
+            # timestamp = datetime.now().timestamp()
+            # logging.info(f"time before speaking:{timestamp}")
             try:
                 synthesizer.streaming_complete()
             except Exception as e:

@@ -72,10 +72,10 @@ class RealtimeMp3Player:
         if not self.ffmpeg_path:
             print("Error: Cannot start player without ffmpeg")
             return False
-        print("before pyaudio")  
+        
         with self.listen_lock:
             self._player = pyaudio.PyAudio()  # initialize pyaudio to play audio
-        print("after pyaudio")
+        
         self._stream = self._player.open(
             format=pyaudio.paInt16, channels=1, rate=22050,
             output=True)  # initialize pyaudio stream

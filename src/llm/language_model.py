@@ -121,8 +121,22 @@ class StreamingLanguageModel(LanguageModel):
             
             # Extract the response text
             if response.status_code == 200:
-                result["response"] = response.output.choices[0].message.content
-                result["success"] = True
+                # Check for different response formats
+                if (hasattr(response, 'output') and response.output and 
+                    hasattr(response.output, 'text') and response.output.text):
+                    # Format 1: response.output.text (DashScope format)
+                    result["response"] = response.output.text
+                    result["success"] = True
+                elif (hasattr(response, 'output') and response.output and 
+                      hasattr(response.output, 'choices') and response.output.choices and 
+                      len(response.output.choices) > 0 and response.output.choices[0] and
+                      hasattr(response.output.choices[0], 'message') and response.output.choices[0].message and
+                      hasattr(response.output.choices[0].message, 'content')):
+                    # Format 2: response.output.choices[0].message.content (OpenAI-like format)
+                    result["response"] = response.output.choices[0].message.content
+                    result["success"] = True
+                else:
+                    result["error"] = "Invalid response structure from API"
             else:
                 result["error"] = f"API Error: {response.code} - {response.message}"
             
@@ -178,15 +192,31 @@ class StreamingLanguageModel(LanguageModel):
             full_response = ""
             for response in stream_response:
                 if response.status_code == 200:
-                    # Get text chunk
-                    chunk = response.output.choices[0].message.content
+                    # Check for different streaming response formats
+                    chunk = None
                     
-                    # Add to full response
-                    full_response += chunk
+                    if (hasattr(response, 'output') and response.output and 
+                        hasattr(response.output, 'choices') and response.output.choices and 
+                        len(response.output.choices) > 0 and response.output.choices[0] and
+                        hasattr(response.output.choices[0], 'message') and response.output.choices[0].message and
+                        hasattr(response.output.choices[0].message, 'content')):
+                        # Format 1: response.output.choices[0].message.content (streaming format)
+                        chunk = response.output.choices[0].message.content
+                    elif (hasattr(response, 'output') and response.output and 
+                          hasattr(response.output, 'text') and response.output.text):
+                        # Format 2: response.output.text (non-streaming format)
+                        chunk = response.output.text
                     
-                    # Call the callback if provided
-                    if chunk_callback:
-                        chunk_callback(chunk)
+                    if chunk:
+                        # Add to full response
+                        full_response += chunk
+                        
+                        # Call the callback if provided
+                        if chunk_callback:
+                            chunk_callback(chunk)
+                    else:
+                        print("Warning: No content in streaming response chunk")
+                        continue
                 else:
                     result["error"] = f"API Error: {response.code} - {response.message}"
                     return result
