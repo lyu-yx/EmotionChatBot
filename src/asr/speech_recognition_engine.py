@@ -61,6 +61,10 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         self.model = 'paraformer-realtime-v2'
         print(f"Using Dashscope ASR model: {self.model}")
         
+        # 自适应环境噪音阈值采集
+        self.silence_threshold = self._collect_env_rms()
+        print(f"[ASR] 自适应静音阈值: {self.silence_threshold}")
+        
     def init_dashscope_api_key(self):
         """Set Dashscope API key from environment variable or config file"""
         # Get the path to the .env file or config.json in the project root
@@ -105,6 +109,47 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         
         # If we got here, no API key was found
         print("Warning: No Dashscope API key found. Please set ALIBABA_API_KEY environment variable or add to config.json")
+    
+    def _collect_env_rms(self):
+        """采集环境噪音rms，返回自适应静音阈值"""
+        import pyaudio
+        import time
+        
+        try:
+            env_rms_samples = []
+            env_sample_time = 2.0  # 增加到2秒，采集更多样本
+            sample_rate = self.sample_rate
+            block_size = self.block_size
+            
+            mic = pyaudio.PyAudio()
+            stream = mic.open(format=self.FORMAT, channels=1, rate=sample_rate, input=True)
+            frames = int(sample_rate * env_sample_time / block_size)
+            
+            print("请保持安静，正在采集环境噪音（2秒）...")
+            for i in range(frames):
+                data = stream.read(block_size, exception_on_overflow=False)
+                rms = sum(abs(int.from_bytes(data[i:i+2], byteorder='little', signed=True)) 
+                          for i in range(0, len(data), 2)) / (len(data)/2)
+                env_rms_samples.append(rms)
+                if i % 5 == 0:  # 每5帧打印一次，减少输出
+                    print(f"采集环境噪音rms: {rms}")
+                
+            stream.stop_stream()  
+            stream.close()
+            mic.terminate()
+            
+            if env_rms_samples:
+                env_rms = sum(env_rms_samples) / len(env_rms_samples)
+                # 使用更保守的策略：取环境噪音的1.5-2倍，且设置最小值800
+                adaptive_threshold = max(800, env_rms * 1.5)
+                print(f"环境噪音均值: {env_rms}, 自适应阈值: {adaptive_threshold}")
+                return adaptive_threshold
+            else:
+                return 800  # 更合理的fallback值
+                
+        except Exception as e:
+            print(f"环境噪音采集失败: {e}, 使用默认阈值800")
+            return 800
     
     def recognize_from_microphone(self) -> Dict[str, Any]:
         """Recognize speech from microphone using Dashscope ASR
@@ -212,7 +257,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             start_time = time.time()
             silence_start = None
             silence_duration = 0
-            silence_threshold = 200  # Adjusted silence detection (higher = less sensitive)
+            silence_threshold = self.silence_threshold  # 使用初始化时采集的自适应阈值
             silence_time_to_stop = 0.5  # Silence duration required to stop recording (reduced from 5s to 2s)
             
             try:
@@ -230,6 +275,8 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
                         rms = sum(abs(int.from_bytes(data[i:i+2], byteorder='little', signed=True)) 
                                 for i in range(0, len(data), 2)) / (len(data)/2)
                         
+                        # Debug print for silence detection
+                        print(f"rms={rms}, silence_duration={silence_duration}, threshold={silence_threshold}")
                         # Check for silence
                         if rms < silence_threshold:
                             if silence_start is None:

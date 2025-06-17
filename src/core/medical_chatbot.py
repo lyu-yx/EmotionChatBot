@@ -58,7 +58,9 @@ class MedicalDiagnosisChatbot:
         
         # Initialize speech recognition engine
         self.recognizer = recognizer if recognizer else DashscopeSpeechRecognizer(language=language)
-        
+        self.full_conversation = []  # 新增：存储完整的对话记录
+        self.output_file = "D:/medical_conversation.json"  # 输出文件名
+        self.start_time = datetime.now()
         # Initialize streaming text-to-speech engine
         # Choose voice based on language
         voice = "loongstella" if language.startswith("zh") else "xiaomo"
@@ -393,7 +395,7 @@ class MedicalDiagnosisChatbot:
             print(f"LLM warmup failed (not critical): {e}")
             
         print("Medical Diagnosis Chatbot initialized with logical flow control")
-    
+
     def listen_continuous(self):
         """Continuously listen for user input in a background thread"""
         while True:
@@ -403,17 +405,38 @@ class MedicalDiagnosisChatbot:
                         # Check if speech is ongoing and should be interrupted
                         if self.is_speaking:
                             # Let the speech complete for medical consultation accuracy
-                            time.sleep(0.1)
+                            #time.sleep(0.1)
                             continue
-                        
+
                         # Recognize speech
                         result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
                             self.queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
-            time.sleep(0.05)  # Small sleep to prevent CPU overuse
-    
+            #time.sleep(0.05)  # Small sleep to prevent CPU overuse
+    def listen(self) -> Dict[str, Any]:
+        """Listen for user input via microphone
+
+        Returns:
+            Dict with recognition results
+        """
+        # Don't listen if we're currently speaking
+        with self.lock:
+            if self.is_speaking:
+                print("Speaking in progress, postponing listening...")
+                time.sleep(0.5)  # Small delay to check again
+        result = self.recognizer.recognize_from_microphone()
+        if result and result["text"]:
+            # 记录用户的发言
+            self.full_conversation.append({
+                "speaker": "user",
+                "text": result["text"],
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+
+        return result
+
     def speak(self, text: str) -> Dict[str, Any]:
         """Convert text to speech and speak it, with protection against recording
         
@@ -427,7 +450,11 @@ class MedicalDiagnosisChatbot:
             # Set the speaking flag to prevent listening while speaking
             with self.lock:
                 self.is_speaking = True
-                
+            self.full_conversation.append({
+                "speaker": "assistant",
+                "text": text,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
             # Speak the text
             result = self.tts.speak(text)
             print(f"Speaking: {text[:50]}{'...' if len(text) > 50 else ''}")
@@ -437,7 +464,76 @@ class MedicalDiagnosisChatbot:
             # Make sure to reset the flag even if an error occurs
             with self.lock:
                 self.is_speaking = False
-    
+
+    def save_conversation_to_json(self):
+        """生成严格一问一答的对话记录（回答时间=问题时间）"""
+        paired_dialog = []
+
+        # 按话题顺序遍历
+        for topic in self.consultation_flow:
+            topic_id = topic["id"]
+            user_response = self.raw_responses.get(topic_id, "")
+
+            if not user_response:  # 跳过未回答的问题
+                continue
+
+            # 添加问题-回答对
+            paired_dialog.append({
+                "speaker": "assistant",
+                "text": topic["question"],
+            })
+            paired_dialog.append({
+                "speaker": "user",
+                "text": user_response,
+                "topic": topic_id,
+            })
+
+        # 让大模型根据实际对话生成自然语言总结
+        conversation_text = "\n".join([
+            f"{turn['speaker']}: {turn['text']}"
+            for turn in paired_dialog
+        ])
+
+        summary_prompt = f"""你是一位专业的中医，需要根据以下医患对话生成简洁的病情总结：
+
+                            对话记录：
+                            {conversation_text}
+
+                            总结要求：
+                            1. 只提取患者实际存在的症状
+                            2. 用专业但易懂的语言描述
+                            3. 按照症状重要性排序
+                            4. 忽略患者否认的症状
+                            5. 格式示例：
+                            患者主诉：[主要症状]
+                            伴随症状：[次要症状]
+                            其他情况：[其他信息]
+
+                            中医症状总结："""
+
+        summary_result = self.llm.generate_response(
+            user_input=summary_prompt,
+            conversation_history=[]
+        )
+
+        natural_summary = summary_result["response"] if summary_result["success"] else "无法生成自然语言总结"
+
+        # 保存数据
+        data = {
+            "conversation": paired_dialog,
+            "medical_summary": self.generate_consultation_summary(),
+            "natural_summary": natural_summary  # 新增基于对话的自然语言总结
+        }
+
+        os.makedirs("consultation_logs", exist_ok=True)
+        filename = f"consultation_logs/{self.start_time.strftime('%Y%m%d_%H%M%S')}.json"
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        print(f"问诊记录已保存到 {filename}")
+        return filename
+
     def evaluate_condition(self, condition: str) -> bool:
         """Evaluate a condition string against the collected data
         
@@ -1165,10 +1261,10 @@ class MedicalDiagnosisChatbot:
             summaries["女性生理情况"] = "；".join(female_info) if female_info else "未提供信息"
         
         return summaries
-    
+
     def run_once(self) -> Dict[str, Any]:
         """Run one complete interaction cycle
-        
+
         Returns:
             Dict with interaction results
         """
@@ -1179,7 +1275,7 @@ class MedicalDiagnosisChatbot:
             "error": None,
             "consultation_complete": self.consultation_complete
         }
-        
+
         try:
             # Ensure gender is determined before ending consultation
             if self.current_topic_index >= len(self.consultation_flow) - 1 and not self.consultation_complete:
@@ -1187,100 +1283,105 @@ class MedicalDiagnosisChatbot:
                     # Force ask gender question if not determined yet
                     self.current_topic_index = len(self.consultation_flow) - 1  # Point to gender question
                     self.current_followup_index = -1
-            
+
             # Get the next question
             question = self.get_current_question()
-            
+
             # If no more questions, end the consultation
             if self.current_topic_index >= len(self.consultation_flow) and not self.consultation_complete:
                 print("All topics complete, generating summary...")
                 self.consultation_complete = True
                 summary = self.generate_consultation_summary()
                 print(summary)
-                
+
                 # Speak a completion message
                 completion_message = "非常感谢您的配合，问诊已经完成。我已经为您整理了一份问诊摘要，稍后会交给医生进行专业诊断。祝您早日康复！"
                 self.speak(completion_message)
-                
+                self.save_conversation_to_json()
+                self.cleanup()
                 result["response"] = completion_message
                 result["consultation_complete"] = True
                 result["success"] = True
+
                 return result
-            
+
             # If consultation is already complete, just handle additional questions
             if self.consultation_complete:
                 # Get any final questions from the patient
                 print("Waiting for any final questions from patient...")
                 listen_result = self.queue.get()
-                
+
                 if not listen_result["success"]:
                     result["error"] = listen_result["error"]
                     return result
-                
+
                 user_input = listen_result["text"]
                 result["user_input"] = user_input
-                
+
                 # Check if user wants to end
                 if any(exit_word in user_input for exit_word in ["结束", "退出", "谢谢", "再见"]):
                     result["response"] = "感谢您的配合，问诊已结束。祝您健康！"
                     self.speak(result["response"])
                     result["success"] = True
                     return result
-                
+
                 # Process final questions with LLM
                 llm_result = self.llm.generate_response(
                     user_input=user_input,
                     conversation_history=self.conversation_history
                 )
-                
+
                 if llm_result["success"]:
                     result["response"] = llm_result["response"]
                     self.speak(result["response"])
-                    
+
                     # Update conversation history
                     self.conversation_history.append({"role": "user", "content": user_input})
                     self.conversation_history.append({"role": "assistant", "content": llm_result["response"]})
-                    
+
                     # Trim history if needed
                     if len(self.conversation_history) > self.max_history_length * 2:
                         self.conversation_history = self.conversation_history[-self.max_history_length*2:]
-                    
+
                     result["success"] = True
                 else:
                     result["error"] = llm_result["error"]
-                
+
                 return result
-            
+
             # Speak the current question
             current_topic = self.get_current_topic()
             topic_name = current_topic["id"] if current_topic else "Closing"
             print(f"Current topic: {topic_name}, Follow-up index: {self.current_followup_index}")
             self.speak(question)
-            
+
+            # Start the listening thread
+            self.listen_thread.start()
+
             # Add to conversation history
             self.conversation_history.append({"role": "assistant", "content": question})
-            
+
             # Listen for response
             print("Waiting for patient response...")
             listen_result = self.queue.get()
-            
+
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
                 return result
-                
+
             user_input = listen_result["text"]
             result["user_input"] = user_input
-            
+
             # Add to conversation history
             self.conversation_history.append({"role": "user", "content": user_input})
-            
+
             # Trim history if needed
             if len(self.conversation_history) > self.max_history_length * 2:
                 self.conversation_history = self.conversation_history[-self.max_history_length*2:]
-            
+
             # Process the response
             should_continue = self.process_response(user_input)
-            
+
             if not should_continue:
                 # Mark consultation as complete
                 self.consultation_complete = True
@@ -1289,67 +1390,67 @@ class MedicalDiagnosisChatbot:
                 print("医疗问诊摘要:")
                 print(summary)
                 print("="*50)
-                
+
                 # Speak a completion message
                 completion_message = "非常感谢您的配合，问诊已经完成。我已经为您整理了一份问诊摘要，稍后会交给医生进行专业诊断。祝您早日康复！"
                 self.speak(completion_message)
-                
+
                 result["response"] = completion_message
                 result["consultation_complete"] = True
             else:
                 # Give feedback based on relevance
                 if not self.response_relevant:
                     response_message = "您的回答可能与问题不太相关，让我们再试一次。"
-                    self.speak(response_message)
+                    #self.speak(response_message)
                     result["response"] = response_message
                 else:
                     result["response"] = "收到您的回答，继续下一个问题。"
-            
+
             # Success
             result["success"] = True
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             result["error"] = f"Error during medical consultation: {e}"
-            
+
         return result
-    
+
     def run_consultation(self, exit_phrase: str = "结束问诊"):
         """Run the complete medical consultation
-        
+
         Args:
             exit_phrase: Phrase to exit the consultation
-            
+
         Returns:
             The consultation summary
         """
         print("Starting Medical Diagnosis Chatbot with logical flow control...")
         print(f"Say '{exit_phrase}' to end consultation.")
+
         
-        # Start the listening thread
-        self.listen_thread.start()
-        
+
         # Initial greeting
         greeting = "您好，我是您的智能问诊助手。接下来我会通过提问来了解您的健康状况，这样能帮助医生更好地了解您的情况。准备好了吗？我们开始第一个问题。"
         self.speak(greeting)
-        
+
         # Wait for a moment to let the greeting sink in
         time.sleep(1)
-        
+
         running = True
         consultation_summary = None
         
+        # Start the listening thread
         while running:
             # Run one interaction cycle
             result = self.run_once()
-            
+
             if not result["success"]:
                 if result["error"]:
                     print(f"Error: {result['error']}")
                     error_message = "抱歉，出现了一些技术问题。让我们继续问诊。"
                     self.speak(error_message)
-            
+
             # Check if consultation is complete
             if result["consultation_complete"] and not consultation_summary:
                 consultation_summary = self.generate_consultation_summary()
@@ -1357,58 +1458,55 @@ class MedicalDiagnosisChatbot:
                 print("医疗问诊摘要:")
                 print(consultation_summary)
                 print("="*50 + "\n")
-            
+
             # Check if user wants to exit
             if result["user_input"] and exit_phrase in result["user_input"]:
-                goodbye = "感谢您的配合，问诊已结束。祝您健康！"
-                self.speak(goodbye)
                 running = False
-            
+
             # Brief pause between interactions
             time.sleep(0.25)
-        
         print("Medical consultation completed.")
         self.cleanup()
-        
+
         # Return the consultation summary if available
         return consultation_summary if consultation_summary else self.generate_consultation_summary()
-    
+
     def cleanup(self):
         """Clean up resources when shutting down"""
         self.listen_interrupt_stop.set()
-    
+
     def is_response_relevant(self, response: str) -> bool:
         """Check if the user's response is relevant to the current question
-        
+
         Args:
             response: The user's response text
-            
+
         Returns:
             Boolean indicating if the response is relevant
         """
         current_question = self.get_base_question()
-        
+
         # Create a system prompt for relevance check
         system_prompt = (
             "你是一个医疗问诊对话分析专家。你的任务是判断患者的回答是否与当前问题相关。"
             "请分析患者回答的内容是否针对了问题所问的方面，即使回答是'没有'也算相关。"
             "如果回答完全不相关或答非所问，请返回'不相关'，否则返回'相关'。"
         )
-        
+
         # Create the relevance check prompt
         check_prompt = (
             f"当前问题：\"{current_question}\"\n\n"
             f"患者回答：\"{response}\"\n\n"
             f"请判断患者回答是否与当前问题相关？"
         )
-        
+
         result = self.llm.generate_response(
             user_input=check_prompt,
             conversation_history=[{"role": "system", "content": system_prompt}]
         )
-        
+
         if result["success"]:
             return "相关" in result["response"] and "不相关" not in result["response"]
-        
+
         # Default to assuming the response is relevant if LLM call fails
         return True
