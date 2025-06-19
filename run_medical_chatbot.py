@@ -165,6 +165,7 @@ def main():
             f.write(f"**情感检测**: {'是' if args.use_emotion else '否'}\n\n")
             f.write("---\n\n")
             f.write(summary)
+            f.write("---\n\n")
             summary_prompt = f"""你是一位专业的中医，需要根据以下医患对话生成简洁的病情总结：
 
                             对话记录：
@@ -187,7 +188,8 @@ def main():
                 user_input=summary_prompt,
                 conversation_history=[]
             )
-            f.write(summary_result)
+            natural_summary = summary_result["response"] if summary_result["success"] else "无法生成自然语言总结"
+            f.write(natural_summary)
         print(f"\n📄 问诊摘要已保存至文件: {filename}")
         print("=" * 60)
         
