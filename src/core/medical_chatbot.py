@@ -56,8 +56,19 @@ class MedicalDiagnosisChatbot:
                 "请使用专业但通俗易懂的语言，让患者感到温暖和被理解。"
             )
         
-        # Initialize speech recognition engine
-        self.recognizer = recognizer if recognizer else DashscopeSpeechRecognizer(language=language)
+        # Initialize speech recognition engine with medical vocabulary enhancement
+        if recognizer:
+            self.recognizer = recognizer
+        else:
+            try:
+                from src.asr.medical_vocabulary import MedicalEnhancedASR
+                base_recognizer = DashscopeSpeechRecognizer(language=language)
+                self.recognizer = MedicalEnhancedASR(base_recognizer)
+                print("✓ Medical vocabulary enhancement enabled")
+            except Exception as e:
+                print(f"Warning: Could not enable medical vocabulary: {e}")
+                print("Using base recognizer without medical vocabulary")
+                self.recognizer = DashscopeSpeechRecognizer(language=language)
         self.full_conversation = []  # 新增：存储完整的对话记录
         self.output_file = "D:/medical_conversation.json"  # 输出文件名
         self.start_time = datetime.now()
@@ -416,25 +427,55 @@ class MedicalDiagnosisChatbot:
                         print(f"Listen thread exception: {e}")
             #time.sleep(0.05)  # Small sleep to prevent CPU overuse
     def listen(self) -> Dict[str, Any]:
-        """Listen for user input via microphone
+        """Listen for user input via microphone with retry for no speech detected
 
         Returns:
             Dict with recognition results
         """
-        # Don't listen if we're currently speaking
-        with self.lock:
-            if self.is_speaking:
-                print("Speaking in progress, postponing listening...")
-                time.sleep(0.5)  # Small delay to check again
-        result = self.recognizer.recognize_from_microphone()
-        if result and result["text"]:
-            # 记录用户的发言
-            self.full_conversation.append({
-                "speaker": "user",
-                "text": result["text"],
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-
+        max_retries = 3  # Maximum number of retries for no speech detected
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            # Don't listen if we're currently speaking
+            with self.lock:
+                if self.is_speaking:
+                    print("Speaking in progress, postponing listening...")
+                    #time.sleep(0.5)  # Small delay to check again
+            
+            result = self.recognizer.recognize_from_microphone()
+            
+            # If we got text, record it and return
+            if result and result["text"]:
+                # 记录用户的发言
+                self.full_conversation.append({
+                    "speaker": "user",
+                    "text": result["text"],
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                return result
+            
+            # Check if this is a "no speech detected" error that should trigger retry
+            if result and result.get("error") == "No speech detected - please try again":
+                retry_count += 1
+                if retry_count < max_retries:
+                    print(f"\n🔄 Retrying... ({retry_count}/{max_retries})")
+                    print("Please speak now:")
+                    time.sleep(0.5)  # Brief pause before retry
+                    continue
+                else:
+                    print(f"\n⏰ No speech detected after {max_retries} attempts.")
+                    # Return a special result indicating timeout
+                    return {
+                        "text": "",
+                        "success": False,
+                        "error": "No speech detected after multiple attempts",
+                        "timeout": True
+                    }
+            else:
+                # Other types of errors or successful empty results
+                return result
+        
+        # This shouldn't be reached, but just in case
         return result
 
     def speak(self, text: str) -> Dict[str, Any]:
@@ -496,20 +537,20 @@ class MedicalDiagnosisChatbot:
 
         summary_prompt = f"""你是一位专业的中医，需要根据以下医患对话生成简洁的病情总结：
 
-    对话记录：
-    {conversation_text}
+                            对话记录：
+                            {conversation_text}
 
-    总结要求：
-    1. 只提取患者实际存在的症状
-    2. 用专业但易懂的语言描述
-    3. 按照症状重要性排序
-    4. 忽略患者否认的症状
-    5. 格式示例：
-    患者主诉：[主要症状]
-    伴随症状：[次要症状]
-    其他情况：[其他信息]
+                            总结要求：
+                            1. 只提取患者实际存在的症状
+                            2. 用专业但易懂的语言描述
+                            3. 按照症状重要性排序
+                            4. 忽略患者否认的症状
+                            5. 格式示例：
+                            患者主诉：[主要症状]
+                            伴随症状：[次要症状]
+                            其他情况：[其他信息]
 
-    中医症状总结："""
+                            中医症状总结："""
 
         summary_result = self.llm.generate_response(
             user_input=summary_prompt,
@@ -757,7 +798,7 @@ class MedicalDiagnosisChatbot:
                 fields = []
         else:
             fields = current_topic["fields"]
-            
+
         # Create a system prompt for the LLM to extract data
         system_prompt = (
             "你是一个医疗问诊数据提取专家。你的任务是从患者回答中提取特定字段的信息。"
@@ -882,22 +923,22 @@ class MedicalDiagnosisChatbot:
                 return "male"
         
         # If no clear indicators, use LLM to determine
-        system_prompt = "你是一个分析系统，需要从文本中判断说话者的性别。"
-        analysis_prompt = f"根据以下文本，判断说话者是男性还是女性（如果无法确定，请回答'未知'）：\n\n{response}"
+        #system_prompt = "你是一个分析系统，需要从文本中判断说话者的性别。"
+        #analysis_prompt = f"根据以下文本，判断说话者是男性还是女性（如果无法确定，请回答'未知'）：\n\n{response}"
         
-        result = self.llm.generate_response(
-            user_input=analysis_prompt,
-            conversation_history=[{"role": "system", "content": system_prompt}]
-        )
+        #result = self.llm.generate_response(
+        #    user_input=analysis_prompt,
+        #    conversation_history=[{"role": "system", "content": system_prompt}]
+        #)
         
-        if result["success"]:
-            if "女" in result["response"]:
-                return "female"
-            elif "男" in result["response"]:
-                return "male"
+        #if result["success"]:
+        #    if "女" in result["response"]:
+        #        return "female"
+        #    elif "男" in result["response"]:
+        #        return "male"
         
         # Default if analysis fails
-        return "unknown"
+        #return "unknown"
     
     def detect_gender(self, response: str) -> None:
         """Detect the patient's gender from their response
@@ -1309,11 +1350,19 @@ class MedicalDiagnosisChatbot:
             if self.consultation_complete:
                 # Get any final questions from the patient
                 print("Waiting for any final questions from patient...")
-                listen_result = self.queue.get()
+                listen_result = self.listen()
 
                 if not listen_result["success"]:
-                    result["error"] = listen_result["error"]
-                    return result
+                    # Check if this is a timeout during final questions
+                    if listen_result.get("timeout"):
+                        # For final questions, timeout means user is done
+                        result["response"] = "感谢您的配合，问诊已结束。祝您健康！"
+                        self.speak(result["response"])
+                        result["success"] = True
+                        return result
+                    else:
+                        result["error"] = listen_result["error"]
+                        return result
 
                 user_input = listen_result["text"]
                 result["user_input"] = user_input
@@ -1326,6 +1375,7 @@ class MedicalDiagnosisChatbot:
                     return result
 
                 # Process final questions with LLM
+
                 llm_result = self.llm.generate_response(
                     user_input=user_input,
                     conversation_history=self.conversation_history
@@ -1360,11 +1410,21 @@ class MedicalDiagnosisChatbot:
 
             # Listen for response
             print("Waiting for patient response...")
-            listen_result = self.queue.get()
+            listen_result = self.listen()
 
             if not listen_result["success"]:
-                result["error"] = listen_result["error"]
-                return result
+                # Check if this is a timeout (no speech detected after retries)
+                if listen_result.get("timeout"):
+                    # Handle timeout gracefully - ask the question again
+                    timeout_message = "看起来您可能需要更多时间思考。让我重新问一遍这个问题。"
+                    self.speak(timeout_message)
+                    result["response"] = timeout_message
+                    result["success"] = True
+                    return result
+                else:
+                    # Other errors
+                    result["error"] = listen_result["error"]
+                    return result
 
             user_input = listen_result["text"]
             result["user_input"] = user_input
@@ -1425,19 +1485,21 @@ class MedicalDiagnosisChatbot:
         print("Starting Medical Diagnosis Chatbot with logical flow control...")
         print(f"Say '{exit_phrase}' to end consultation.")
 
-        # Start the listening thread
-        self.listen_thread.start()
+        
 
         # Initial greeting
         greeting = "您好，我是您的智能问诊助手。接下来我会通过提问来了解您的健康状况，这样能帮助医生更好地了解您的情况。准备好了吗？我们开始第一个问题。"
         self.speak(greeting)
 
         # Wait for a moment to let the greeting sink in
-        time.sleep(1)
+        time.sleep(0.1)
 
         running = True
         consultation_summary = None
-
+        
+        # Note: We use direct listening instead of background thread to avoid
+        # multiple recording indicators running simultaneously
+        
         while running:
             # Run one interaction cycle
             result = self.run_once()
@@ -1471,6 +1533,10 @@ class MedicalDiagnosisChatbot:
     def cleanup(self):
         """Clean up resources when shutting down"""
         self.listen_interrupt_stop.set()
+        
+        # Clean up recognizer resources (including medical vocabulary if used)
+        if hasattr(self.recognizer, 'cleanup'):
+            self.recognizer.cleanup()
 
     def is_response_relevant(self, response: str) -> bool:
         """Check if the user's response is relevant to the current question
