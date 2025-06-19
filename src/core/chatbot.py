@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 import os
 import time
 import threading
+import queue
 import numpy as np
 # Import our component interfaces directly from their modules
 from src.asr.speech_recognition_engine import SpeechRecognizer, DashscopeSpeechRecognizer
@@ -18,6 +19,10 @@ from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetect
 from src.emotion.identify import EmotionDetectorCamera
 from src.core.SharedQueue import SharedQueue as q
 from src.core.SharedLock import SharedLock as lock
+from datetime import datetime
+import logging
+import random
+logging.basicConfig(level=logging.INFO)
 from collections import deque
 # Configuration flags
 USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
@@ -145,24 +150,38 @@ class EmotionAwareStreamingChatbot:
 
         # Flag to indicate if TTS is currently active
         self.is_speaking = False
-
-        #Flag to judge whether the bot is active
+        
+        # Flag to judge whether the bot is active
         self.is_active = False
-
+        
         # Lock for thread safety
         self.lock = threading.Lock()
-
-        #Store the message
+        
+        # Store the message
         self.queue = q()
-
-        #Control the listen_continuous thread
-        self.listen_all = threading.Thread(target = self.listen_continuous)
-        self.listen_all.daemon = True
+        
+        # Enhanced response cache with frequency tracking and TTL
+        self.response_cache = {}
+        self.cache_ttl = 3600  # Time-to-live for cache entries in seconds
+        self.cache_hit_counter = {}  # Track frequency of cache hits
+        self.cache_timestamp = {}  # Track when items were added to cache
+        self.max_cache_size = 100  # Maximum number of items in cache
+        
+        
+        # Prefetch settings
+        self.prefetch_enabled = True
+        self.preprocessing_complete = threading.Event()
+        
+        # Control the listen_continuous thread
+        self.listen_thread = threading.Thread(target=self.listen_continuous)
+        self.listen_thread.daemon = True
         self.listen_interrupt_stop = threading.Event()
-
-        #Lock to avoid listen confliction
+        
+        # wake word list
+        self.wake_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
+        # Lock to avoid listen confliction
         self.listen_lock = lock()
-
+        
         # Emotion monitoring thread
         self._emotion_monitor_active = False
         self._emotion_monitor_thread = None
@@ -170,9 +189,23 @@ class EmotionAwareStreamingChatbot:
         self.emotion_window = deque(maxlen=10)  # 10秒滑动窗口
         self.negative_threshold = 0.5
         self._passive_running = False
-
+            
+        # Threads will be started in the run_continuous method
         print("Emotion-Aware Streaming Chatbot initialized")
-
+    
+    def listen_continuous(self):
+        """Continuously listen for user input in a background thread"""
+        while True:
+            #with self.listen_lock:
+                if not self.listen_interrupt_stop.is_set():
+                    try:
+                        # Recognize speech
+                        result = self.recognizer.recognize_from_microphone()
+                        if result and result["text"] != '':
+                            self.queue.put(result)
+                    except Exception as e:
+                        print(f"Listen thread exception: {e}")
+                        
     def start_emotion_monitoring(self):
         """Start the background emotion monitoring thread"""
         if self._emotion_monitor_thread is None or not self._emotion_monitor_thread.is_alive():
@@ -184,13 +217,6 @@ class EmotionAwareStreamingChatbot:
             self._emotion_monitor_thread.start()
             print("Started background emotion monitoring")
 
-    def stop_emotion_monitoring(self):
-        """Stop the background emotion monitoring thread"""
-        self._stop_emotion_monitor.set()
-        if self._emotion_monitor_thread is not None:
-            self._emotion_monitor_thread.join(timeout=1)
-            print("Stopped background emotion monitoring")
-
     def _emotion_monitor_loop(self):
         while not self._stop_emotion_monitor.is_set():
             # 获取当前情绪（假设返回字典包含emotion和confidence）
@@ -201,7 +227,7 @@ class EmotionAwareStreamingChatbot:
             self.emotion_window.append(is_negative)
 
             # 每0.5秒检测一次（10秒窗口=20次检测）
-            #time.sleep(0.5)
+            time.sleep(0.5)
 
             # 当窗口满时计算负面情绪占比
             if len(self.emotion_window) == self.emotion_window.maxlen:
@@ -267,18 +293,6 @@ class EmotionAwareStreamingChatbot:
             print(f"讲笑话失败: {e}")
             self.speak("哎呀，我的笑话库卡住了")
 
-    def listen_continuous(self):
-        while True:
-            with self.listen_lock:
-                if not self.listen_interrupt_stop.is_set():
-                    try :
-                        result = self.recognizer.recognize_from_microphone()
-                        if result and result["text"] != '':
-                            self.queue.put(result)
-                    except Exception as e:
-                        print(f"监听线程异常：{e}")
-            time.sleep(0.3)
-
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
 
@@ -307,20 +321,6 @@ class EmotionAwareStreamingChatbot:
 
         # Fall back to text emotion or neutral
         return self.text_emotion if self.use_text_emotion else "neutral"
-
-    def listen(self) -> Dict[str, Any]:
-        """Listen for user input via microphone
-
-        Returns:
-            Dict with recognition results
-        """
-        # Don't listen if we're currently speaking
-        with self.lock:
-            if self.is_speaking:
-                print("Speaking in progress, postponing listening...")
-                time.sleep(0.5)  # Small delay to check again
-
-        return self.recognizer.recognize_from_microphone()
 
     def process_emotion(self, text: str) -> str:
         """Process text to detect emotions and update user emotional state
@@ -368,8 +368,8 @@ class EmotionAwareStreamingChatbot:
             result = self.tts.speak(text)
             print("after speak")
             # Add a small delay after speaking to avoid cutting off
-            time.sleep(0.1)
-
+            #time.sleep(0.1)
+            
             return result
         finally:
             # Make sure to reset the flag even if an error occurs
@@ -387,6 +387,7 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Dict with response generation results
         """
+        start = time.time()
         result = {
             "user_input": user_input,
             "response": "",
@@ -494,7 +495,7 @@ class EmotionAwareStreamingChatbot:
             return True
 
         return False
-
+    
     def run_once(self, full_response: bool = False, exit_phase: str = "再见") -> Dict[str, Any]:
         """Run one complete interaction cycle
 
@@ -520,13 +521,13 @@ class EmotionAwareStreamingChatbot:
                     if not self.is_speaking:
                         break
                 print("Waiting for speech to complete before listening...")
-                time.sleep(0.5)
-                # 检查队列是否为空
-
+                time.sleep(0.25)
+                
             # Step 1: Listen for user input
             print("Listening for user input...")
-            print(self.queue.peek())
             listen_result = self.queue.get()
+            timestamp = datetime.now().timestamp()
+            logging.info(f"after queue get:{timestamp}")
             if not listen_result["success"]:
                 result["error"] = listen_result["error"]
                 return result
@@ -543,7 +544,6 @@ class EmotionAwareStreamingChatbot:
             # Step 3: Get the current emotion (combines camera and/or text)
             current_emotion = self.get_current_emotion()
             result["user_emotion"] = current_emotion
-
             # Step 4: Process with streaming LLM and TTS
             process_result = self.process_streaming(user_input, current_emotion, full_response)
 
@@ -562,17 +562,8 @@ class EmotionAwareStreamingChatbot:
         return result
 
     def run_continuous(self, wake_word: Optional[str] = None, exit_phrase: str = "exit", full_response: bool = False, activation_timeout: int = 60, debug_mode: bool = True):
-        """Run the chatbot in continuous mode
-
-        Args:
-            wake_word: Optional wake word to start interaction (e.g., "Hey Siri")
-            exit_phrase: Phrase to exit the interaction
-            full_response: If True, wait for the complete response before speaking
-            activation_timeout: Seconds to remain active after wake word detection (0 for always active)
-            debug_mode: If True, prints additional debugging information
-        """
+        """Run the chatbot in continuous mode with improved parallel processing"""
         language_display = "Chinese" if self.language.startswith("zh") else "English"
-        self.start_emotion_monitoring()
         # Prepare emotion detection mode for display
         emotion_modes = []
         if self.use_text_emotion:
@@ -616,8 +607,8 @@ class EmotionAwareStreamingChatbot:
                 greeting = f"Hello! I'm an emotion-aware voice assistant. Say '{wake_word}' to wake me up when you need me."
             else:
                 greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
-
-        print("Starting initial greeting...")
+        
+        print("Starting initial greeting...") 
         self.speak(greeting)
 
         # Start the emotion monitoring thread
@@ -627,11 +618,13 @@ class EmotionAwareStreamingChatbot:
         self.is_active = not using_wake_word  # If not using wake word, always active
         active_until = 0  # Timestamp when activation expires
         running = True
-        self.listen_all.start()
-
+        
+        # Start all background threads
+        print("Starting background threads...")
+        self.listen_thread.start()
+        
         while running:
             print("\n" + "="*50)
-
             # Check if we need to listen for wake word
             if using_wake_word and not self.is_active:
                 print(waiting_message)
@@ -650,8 +643,6 @@ class EmotionAwareStreamingChatbot:
                                 print(f"DEBUG - Wake word phase recognized: '{text}'")
                                 print(f"DEBUG - Looking for wake word: '{wake_word.lower()}'")
                                 print(f"DEBUG - Wake word in text: {wake_word.lower() in text}")
-                                similarity = self._calculate_text_similarity(wake_word.lower(), text)
-                                print(f"DEBUG - Text similarity score: {similarity:.2f}")
 
                             # Check if user said the exit phrase
                             if text == exit_phrase.lower() or exit_phrase.lower() in text:
@@ -664,7 +655,7 @@ class EmotionAwareStreamingChatbot:
                                 break
 
                             # Check if user said the wake word
-                            if wake_word.lower() in text:
+                            if any(w.lower() in text.lower() for w in self.wake_word_list):
                                 print(f"Wake word detected: '{text}'")
                                 wake_word_detected = True
                                 self.is_active = True
@@ -678,8 +669,8 @@ class EmotionAwareStreamingChatbot:
                                     self.speak("I'm listening, go ahead.")
 
                                 # Give user a moment to start their question
-                                time.sleep(0.5)
-
+                                time.sleep(0.25)
+                        
                         # Brief pause between wake word detection attempts to reduce CPU usage
                         time.sleep(0.1)
 
@@ -704,7 +695,7 @@ class EmotionAwareStreamingChatbot:
 
             # Run one interaction cycle
             result = self.run_once(full_response, exit_phrase)
-
+            
             # Print recognition result for debugging
             if result["success"]:
                 print(f"\nYou said: {result['user_input']} (Emotion: {result['user_emotion']})")
@@ -725,51 +716,10 @@ class EmotionAwareStreamingChatbot:
                 running = False
                 self.is_active = False
                 print("Exiting chatbot...")
-
+                self.cleanup_emotion()
             # If there was an error, report it
             elif not result["success"] and result["error"]:
                 print("No message")
-
+            
             # Brief pause between interactions
-            print("Pausing for a moment before next interaction...")
-            time.sleep(0.5)
-
-    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
-        """Calculate similarity between two text strings
-
-        Args:
-            text1: First text string
-            text2: Second text string
-
-        Returns:
-            Similarity score between 0 and 1
-        """
-        # Simple contains check
-        if text1 in text2:
-            return 1.0
-
-        # Check for partial matches
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-
-        if not words1 or not words2:
-            return 0.0
-
-        # Calculate Jaccard similarity
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-
-        return intersection / union if union > 0 else 0.0
-
-    def cleanup(self):
-        """Clean up resources when shutting down"""
-        # Stop emotion monitoring
-        self.stop_emotion_monitoring()
-
-        # Stop camera detector if it was initialized
-        if self.use_camera_emotion and self.camera_detector is not None:
-            try:
-                self.camera_detector.stop()
-                print("Camera emotion detection stopped")
-            except Exception as e:
-                print(f"Error stopping camera detection: {e}")
+            time.sleep(0.25)

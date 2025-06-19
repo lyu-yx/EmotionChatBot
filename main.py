@@ -66,13 +66,13 @@ def main():
     
     # Emotion detection settings
     emotion_group = parser.add_argument_group('Emotion Detection')
-    emotion_group.add_argument("--text-emotion", action="store_true", 
+    emotion_group.add_argument("--text-emotion", default=False, 
                         help="Enable text-based emotion detection (default: disabled)")
-    emotion_group.add_argument("--camera-emotion", action="store_true",default = True,
+    emotion_group.add_argument("--camera-emotion", default=True,
                         help="Enable camera-based emotion detection (default: disabled)")
     emotion_group.add_argument("--camera-id", type=int, default=0,
                         help="Camera ID to use for emotion detection (default: 0)")
-    emotion_group.add_argument("--show-camera", action="store_true",default = True,
+    emotion_group.add_argument("--show-camera", action="store_true",default=True,
                         help="Show camera feed window (default: hidden)")
     
     # Wake word and activation settings
@@ -87,7 +87,7 @@ def main():
     # Other arguments
     parser.add_argument("--exit-phrase", default="再见",
                         help="Phrase to exit the chatbot (default: 'exit')")
-    parser.add_argument("--full", action="store_true", 
+    parser.add_argument("--full", action="store_true",default=True, 
                         help="Use full response mode instead of streaming speech chunks")
     
     args = parser.parse_args()
@@ -140,7 +140,7 @@ def main():
         print("Text-based emotion detection disabled")
     
     # Create the chatbot with appropriate camera settings
-    chatbot = EmotionAwareStreamingChatbot(
+    chatbot = EmotionAwareStreamingChatbot(  #TODO:1.streaming response to reduce waiting time 2.merge lgz branch(done) 3.continue listen(done) 
         recognizer=recognizer,
         tts=tts,
         llm=llm,
@@ -165,10 +165,6 @@ def main():
         print("\nExiting chatbot due to keyboard interrupt...")
     except Exception as e:
         print(f"Error running chatbot: {e}")
-    finally:
-        # Clean up resources
-        chatbot.cleanup()
-    
     print("Chatbot session ended.")
 
 

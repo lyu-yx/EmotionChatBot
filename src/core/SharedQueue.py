@@ -1,4 +1,4 @@
-# shared_queue.py
+#The purpose of this class is to centrally manage the access and storage of the current audio stream in the background.
 import queue
 size = 20
 class SharedQueue:

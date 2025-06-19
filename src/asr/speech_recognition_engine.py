@@ -7,8 +7,11 @@ import time
 import threading
 import pyaudio
 import numpy as np
-
-
+from datetime import datetime
+import logging
+from src.core.SharedAudio import AudioManager as Audio
+from src.core.SharedAudio import get_audio_manager
+logging.basicConfig(level=logging.INFO)
 class SpeechRecognizer(abc.ABC):
     """Abstract base class for speech recognition engines"""
     
@@ -59,6 +62,8 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         # Set model based on language
         self.model = 'paraformer-realtime-v2'
         print(f"Using Dashscope ASR model: {self.model}")
+        
+        self.audio_manager = get_audio_manager()
         
     def init_dashscope_api_key(self):
         """Set Dashscope API key from environment variable or config file"""
@@ -133,26 +138,29 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         # Store the final recognized text (not intermediate results)
         final_text = ""
         current_sentence = ""
-        
+        if not hasattr(self, "_mic"):
+            self._mic = self.audio_manager
+        if not hasattr(self, "_mic_stream") or self._mic_stream is None:
+            self._mic_stream = self.audio_manager.get_mic_stream(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=16000,
+                block_size=self.block_size
+            )
         # Real-time speech recognition callback
         class Callback(RecognitionCallback):
             def on_open(self) -> None:
                 print('RecognitionCallback open.')
-                self.mic = pyaudio.PyAudio()
-                self.stream = self.mic.open(format=pyaudio.paInt16,
-                              channels=1,
-                              rate=16000,
-                              input=True)
 
             def on_close(self) -> None:
                 print('RecognitionCallback close.')
-                if hasattr(self, 'stream') and self.stream:
-                    self.stream.stop_stream()
-                    self.stream.close()
-                if hasattr(self, 'mic') and self.mic:
-                    self.mic.terminate()
-                self.stream = None
-                self.mic = None
+                # if hasattr(self, 'stream') and self.stream:
+                #     self.stream.stop_stream()
+                #     self.stream.close()
+                # if hasattr(self, 'mic') and self.mic:
+                #     self.mic.terminate()
+                # self.stream = None
+                # self.mic = None
 
             def on_complete(self) -> None:
                 print('RecognitionCallback completed.')
@@ -185,7 +193,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
         
         # Create the callback
         callback = Callback()
-        
+        callback.stream = self._mic_stream
         try:
             # Call recognition service in async mode
             recognition = Recognition(
@@ -212,7 +220,7 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             silence_start = None
             silence_duration = 0
             silence_threshold = 200  # Adjusted silence detection (higher = less sensitive)
-            silence_time_to_stop = 1  # Silence duration required to stop recording (reduced from 5s to 2s)
+            silence_time_to_stop = 0.5  # Silence duration required to stop recording (reduced from 5s to 2s)
             
             try:
                 # Continue until timeout or silence detected
@@ -252,8 +260,9 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             recognition.stop()
             
             # Wait a brief moment for final processing
-            time.sleep(0.5)
-            
+            time.sleep(0.25)
+            timestamp = datetime.now().timestamp()
+            logging.info(f"after recognition:{timestamp}")
             # Use the final text if available, otherwise use current sentence
             recognized_text = final_text if final_text else current_sentence
             
@@ -270,11 +279,11 @@ class DashscopeSpeechRecognizer(SpeechRecognizer):
             result["error"] = f"Error during speech recognition: {e}"
             print(f"\nError during Dashscope speech recognition: {e}")
             # Use simulated response as fallback
-            sim_result = self._get_simulated_response()
-            result["text"] = sim_result["text"]
-            result["success"] = True
-            result["engine"] = "simulation_fallback"
-            print(f"Using simulated response: {sim_result['text']}")
+            #sim_result = self._get_simulated_response()
+            # result["text"] = sim_result["text"]
+            # result["success"] = True
+            # result["engine"] = "simulation_fallback"
+            # print(f"Using simulated response: {sim_result['text']}")
         
         return result
     

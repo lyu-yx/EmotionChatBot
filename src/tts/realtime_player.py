@@ -11,7 +11,8 @@ import os
 import shutil
 import sys
 from src.core.SharedLock import SharedLock as lock 
-
+from src.core.SharedAudio import AudioManager as Audio
+from src.core.SharedAudio import get_audio_manager
 class RealtimeMp3Player:
     """Player for streaming MP3 audio in real-time using ffmpeg and pyaudio"""
     
@@ -35,6 +36,7 @@ class RealtimeMp3Player:
         # else:
         #     print("Warning: ffmpeg not found in PATH. Audio playback may not work.")
         self.listen_lock = lock()
+        self.audio_manager = get_audio_manager()
     def _find_ffmpeg(self):
         """Find the ffmpeg binary in the system PATH"""
         ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
@@ -73,12 +75,18 @@ class RealtimeMp3Player:
             print("Error: Cannot start player without ffmpeg")
             return False
         print("before pyaudio")  
-        with self.listen_lock:
-            self._player = pyaudio.PyAudio()  # initialize pyaudio to play audio
+        # with self.listen_lock:
+        #     self._player = pyaudio.PyAudio()  # initialize pyaudio to play audio
+        #with self.listen_lock:
+        self._stream = self.audio_manager.get_output_stream(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=22050
+                    )
         print("after pyaudio")
-        self._stream = self._player.open(
-            format=pyaudio.paInt16, channels=1, rate=22050,
-            output=True)  # initialize pyaudio stream
+        # self._stream = self._player.open(
+        #     format=pyaudio.paInt16, channels=1, rate=22050,
+        #     output=True)  # initialize pyaudio stream
         try:
             self.ffmpeg_process = subprocess.Popen(
                 [
@@ -108,8 +116,9 @@ class RealtimeMp3Player:
             if self.play_thread:
                 self.play_thread.join()
             if self._stream:
-                self._stream.stop_stream()
-                self._stream.close()
+                # self._stream.stop_stream()
+                # self._stream.close()
+                pass
             if self._player:
                 self._player.terminate()
             if self.ffmpeg_process:
