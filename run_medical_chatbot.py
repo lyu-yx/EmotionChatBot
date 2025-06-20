@@ -37,11 +37,20 @@ def check_hotwords_requirements():
     try:
         from src.asr.medical_vocabulary import MedicalVocabularyManager
         vocab_manager = MedicalVocabularyManager()
+        
+        # Check if API key is available
+        api_key = vocab_manager._ensure_api_key()
+        if not api_key:
+            print(f"⚠️ 医疗热词功能需要 DashScope API Key")
+            print("   请在 .env 文件中设置 DASHSCOPE_API_KEY")
+            print("   将使用基础语音识别功能")
+            return False
+            
         stats = vocab_manager.get_vocabulary_statistics()
-
         print(f"✅ 医疗热词模块已加载")
         print(f"   可用热词数量: {stats['total_words']}")
         print(f"   目标模型: {stats['target_model']}")
+        print(f"   API Key: {'已配置' if api_key else '未配置'}")
         return True
     except Exception as e:
         print(f"⚠️ 医疗热词模块加载失败: {e}")
@@ -74,8 +83,8 @@ def main():
         "保持回应简短但信息丰富和有帮助。"
     )
     llm = StreamingLanguageModel(
-        model_name="qwen-turbo",
-        temperature=0.7,
+        model_name="qwen-max-latest",
+        temperature=0.9,
         system_prompt=system_prompt
     )
     parser.add_argument('--language', '-l', default='zh-cn',
@@ -138,7 +147,8 @@ def main():
         if hasattr(chatbot.recognizer, 'vocabulary_manager'):
             vocab_stats = chatbot.recognizer.get_vocabulary_statistics()
             if vocab_stats.get('vocabulary_id'):
-                print(f"🎯 医疗热词表已创建: {vocab_stats['vocabulary_id']}")
+                vocab_status = "复用" if vocab_stats.get('is_reused', False) else "新建"
+                print(f"🎯 医疗热词表已就绪 ({vocab_status}): {vocab_stats['vocabulary_id']}")
             else:
                 print("⚠️ 医疗热词表创建失败，使用基础识别")
 
