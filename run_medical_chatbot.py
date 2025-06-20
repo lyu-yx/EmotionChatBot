@@ -176,7 +176,7 @@ def main():
             f.write("---\n\n")
             f.write(summary)
             f.write("---\n\n")
-            summary_prompt = f"""你是一位专业的中医，需要根据以下医患对话生成简洁的病情总结：
+            summary_prompt = f"""你是一位专业的中医，需要根据以下医患对话生成病情总结：
 
                             对话记录：
                             {summary}
@@ -192,7 +192,9 @@ def main():
                             伴随症状：[次要症状]
                             其他情况：[其他信息]
                             可能病症：[可能患病]   
-                            中医症状总结："""
+                            中医症状总结：
+                            尽可能根据内容多分析一点内容出来，包括病因，可能的病症，以及解决方法
+"""
 
             summary_result = llm.generate_response(
                 user_input=summary_prompt,
