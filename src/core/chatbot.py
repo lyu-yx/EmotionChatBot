@@ -76,8 +76,8 @@ class EmotionAwareStreamingChatbot:
 
         # Initialize streaming language model
         self.llm = llm if llm else StreamingLanguageModel(
-            model_name="qwen-turbo",
-            temperature=0.7,
+            model_name="qwen-max-latest",
+            temperature=0.9,
             system_prompt=system_prompt
         )
 
