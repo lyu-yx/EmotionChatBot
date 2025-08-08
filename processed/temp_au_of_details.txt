@@ -1,0 +1,10 @@
+Input:temp_frame.jpg
+Input full path:E:\pythonProject\EmotionChatBot-main (3)\EmotionChatBot-main\temp_frame.jpg
+Camera parameters:226.693,226.693,103.5,140
+Output csv:temp_au.csv
+Gaze: 0
+AUs: 1
+Landmarks 2D: 0
+Landmarks 3D: 0
+Pose: 0
+Shape parameters: 0

@@ -27,8 +27,9 @@ from collections import deque
 # Configuration flags
 USE_TEXT_EMOTION_DETECTION = False  # Set to True to enable text-based emotion detection
 USE_CAMERA_EMOTION_DETECTION = True  # Set to True to enable camera-based emotion detection
-
-
+import torch
+import subprocess
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class EmotionAwareStreamingChatbot:
     """An emotion-aware streaming chatbot that integrates ASR, LLM, TTS, and emotion detection"""
 
@@ -136,7 +137,7 @@ class EmotionAwareStreamingChatbot:
         self.conversation_history: List[Dict[str, str]] = []
 
         # Maximum number of conversation turns to keep in history
-        self.max_history_length = 10
+        self.max_history_length = 20
 
         # User emotion state tracking
         self.text_emotion = "neutral"
@@ -186,8 +187,14 @@ class EmotionAwareStreamingChatbot:
         self._emotion_monitor_active = False
         self._emotion_monitor_thread = None
         self._stop_emotion_monitor = threading.Event()
-        self.emotion_window = deque(maxlen=10)  # 10秒滑动窗口
-        self.negative_threshold = 0.5
+        self.emotion_window = deque(maxlen=60)  # 10秒滑动窗口
+        self.tired_window = deque(maxlen=2)  # 10秒滑动窗口
+        self.heart_window = deque(maxlen=5)  # 10秒滑动窗口
+        self.distracted_window = deque(maxlen=2)  # 10秒滑动窗口
+        self.negative_threshold = 0.9
+        self.distracted_threshold = 0.7
+        self.tired_threshold =0.7
+        self.heart_threshold =0.7
         self._passive_running = False
             
         # Threads will be started in the run_continuous method
@@ -205,7 +212,7 @@ class EmotionAwareStreamingChatbot:
                             self.queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
-                        
+
     def start_emotion_monitoring(self):
         """Start the background emotion monitoring thread"""
         if self._emotion_monitor_thread is None or not self._emotion_monitor_thread.is_alive():
@@ -223,7 +230,7 @@ class EmotionAwareStreamingChatbot:
             result = self.camera_detector.get_latest_emotion()
 
             # 记录情绪状态（1=负面, 0=非负面）
-            is_negative = 1 if result["emotion"] in ["sad"] else 0
+            is_negative = 1 if result["emotion"] in ["sad", "angry"] else 0
             self.emotion_window.append(is_negative)
 
             # 每0.5秒检测一次（10秒窗口=20次检测）
@@ -232,10 +239,11 @@ class EmotionAwareStreamingChatbot:
             # 当窗口满时计算负面情绪占比
             if len(self.emotion_window) == self.emotion_window.maxlen:
                 negative_ratio = sum(self.emotion_window) / len(self.emotion_window)
-
+                print(negative_ratio)
                 # 达到阈值且当前仍处于负面状态
-                if (negative_ratio >= self.negative_threshold and
-                        is_negative == 1):
+                if (negative_ratio >= 0.75 and  # 提高阈值到75%
+                    is_negative == 1 and
+                    not any(self.emotion_window[-20:])):
                     self._trigger_comfort_behavior()
 
     def _trigger_comfort_behavior(self):
@@ -244,10 +252,6 @@ class EmotionAwareStreamingChatbot:
         if self.is_active or self.is_speaking:
             return
 
-        # 2. 二次验证当前情绪
-        current_emotion = self.camera_detector.get_latest_emotion()
-        if current_emotion["probability"] < 0.7:
-            return
 
         # 3. 执行安慰（讲笑话/音乐等）
         self._tell_joke()
@@ -260,10 +264,10 @@ class EmotionAwareStreamingChatbot:
         if self.is_speaking:  # 不打断现有语音
             return
         try:
-            self.speak(f"检测到您似乎心情不太好，让我讲个笑话吧！")
+            self.speak(f"检测到您似乎心情不太好，记住，您并不孤单，我在这里支持您。")
 
             # 2. 专门生成笑话的prompt
-            joke_prompt = "检测到用户情绪不好，讲个笑话吧"
+            joke_prompt = "检测到用户情绪不好，请给用户相应的关怀，像聊天一样的关怀"
 
             # 3. 获取笑话响应
             collected_response = ""
@@ -292,6 +296,7 @@ class EmotionAwareStreamingChatbot:
         except Exception as e:
             print(f"讲笑话失败: {e}")
             self.speak("哎呀，我的笑话库卡住了")
+
 
     def get_current_emotion(self) -> str:
         """Get the current emotion based on enabled detection methods
@@ -595,16 +600,24 @@ class EmotionAwareStreamingChatbot:
         print(f"Say '{exit_phrase}' to exit.")
         speech_mode = "full response mode" if full_response else "streaming mode"
         print(f"Speech output using {speech_mode}")
-
+        self.start_emotion_monitoring()
         # Initial greeting
-        if language_display == "Chinese":
-            if using_wake_word:
+        if using_wake_word:
+            if language_display == "Chinese":
                 greeting = f"你好! 我是能够感知情绪的语音助手。当你需要我时，请说'{wake_word}'来唤醒我。"
             else:
-                greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？"
-        else:
-            if using_wake_word:
                 greeting = f"Hello! I'm an emotion-aware voice assistant. Say '{wake_word}' to wake me up when you need me."
+        else:
+            demo_path = "/home/liugezhi/桌面/123/demo.py"
+            print("Starting local wake word detection...")
+            print("Starting local wake word detection...")
+            subprocess.run([
+                "python3", demo_path
+            ], check=True)
+            # 2. 唤醒后启动云端交互
+            print("\nWake word detected! Starting cloud-based chatbot...")
+            if language_display == "Chinese":
+                greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？"
             else:
                 greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
@@ -612,7 +625,7 @@ class EmotionAwareStreamingChatbot:
         self.speak(greeting)
 
         # Start the emotion monitoring thread
-        self.start_emotion_monitoring()
+        
 
         # Keep track of activation state when using wake word
         self.is_active = not using_wake_word  # If not using wake word, always active

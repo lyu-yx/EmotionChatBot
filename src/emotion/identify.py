@@ -1,298 +1,82 @@
-# Updated identify.py with 68-point facial landmark detection for micro-expression analysis
-
-import torch
 import cv2
 import time
 import os
-from torchvision import transforms
-import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
 import threading
 from typing import Dict, Any, Optional, Callable
 from PIL import ImageFont, ImageDraw, Image
 import collections
-from deepface import DeepFace
-from scipy.signal import find_peaks, butter, filtfilt
 import dlib
-
-# Set device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Initialize dlib's face detector and landmark predictor
-detector_dlib = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("C:/Users/57124/Downloads/shape_predictor_68_face_landmarks.dat/shape_predictor_68_face_landmarks.dat")
-
-# 多帧投票窗口
+from deepface import DeepFace
+import numpy as np
+import mediapipe as mp
+import math
+# 多帧投票窗口大小
 VOTE_WINDOW = 5
 emotion_window = collections.deque(maxlen=VOTE_WINDOW)
-micro_expression_window = collections.deque(maxlen=VOTE_WINDOW)
 
-# 表情偏置权重
+# 情感偏置权重（用于调整某些情感的敏感度）
 bias_weights = {
-    "happy": 2,
-    "neutral": 1,
-    "sad": 1.3,
-    "angry": 0.8,
-    "fear": 1.0,
+    "happy": 1.5,
+    "neutral": 1.5,
+    "sad": 0.1,
+    "angry": 0.1,
+    "fear": 0.7,
     "disgust": 1.0,
     "surprise": 1.6
 }
 
-# 阈值设置
-thresholds = {
-    'mouth_higth_happy': 0.03,
-    'mouth_higth_amazing': 0.025,
-    'eye_hight_amazing': 0.045,
-    'brow_k_angry': -0.1,
-    'mouth_higth_sad': -0.01,
-    'brow_width_disgust': 0.5,
-    'eye_hight_fear': 0.05,
-    'mouth_core_width': 0.068,
-    'mouth_core_hight': 0.0055,
-    'eye_core_hight': 0.23
-}
-
-# 心跳检测参数
-HR_FPS = 30
-HR_WINDOW_SIZE = HR_FPS * 5  # 5秒数据
-HR_UPDATE_INTERVAL = 3.0  # 每5秒更新一次心率
-HR_SMOOTHING_WINDOW = 3  # 心率平滑窗口大小
-
 
 def cv2_putText_cn(img, text, position, font_path="simhei.ttf", font_size=32, color=(0, 255, 0)):
+    """在OpenCV图像上绘制中文文本"""
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     try:
         font = ImageFont.truetype(font_path, font_size)
     except Exception as e:
-        raise RuntimeError(f"字体加载失败：{e}")
+        raise RuntimeError(f"字体加载失败: {e}")
     draw.text(position, text, font=font, fill=color[::-1])
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 
-def extract_features(landmarks, face_rect):
-    face_width = face_rect.right() - face_rect.left()
-    face_height = face_rect.bottom() - face_rect.top()
-
-    # 嘴巴特征
-    mouth_width = (landmarks.part(54).x - landmarks.part(48).x) / face_width
-    mouth_higth = (landmarks.part(51).y - landmarks.part(57).y) / face_width
-    mouth_core_width = (landmarks.part(59).x - landmarks.part(48).x) / face_width
-    mouth_core_hight = (landmarks.part(48).y - landmarks.part(60).y) / face_width
-    eye_core_hight = (landmarks.part(42).y - landmarks.part(22).y) / face_width
-
-    # 眉毛特征
-    brow_sum = 0  # 高度之和
-    frown_sum = 0  # 两边眉毛距离之和
-    line_brow_x = []
-    line_brow_y = []
-
-    for j in range(17, 21):
-        brow_sum += (landmarks.part(j).y - face_rect.top()) + (landmarks.part(j + 5).y - face_rect.top())
-        frown_sum += landmarks.part(j + 5).x - landmarks.part(j).x
-        line_brow_x.append(landmarks.part(j).x)
-        line_brow_y.append(landmarks.part(j).y)
-
-    # 眉毛倾斜度
-    tempx = np.array(line_brow_x)
-    tempy = np.array(line_brow_y)
-    if len(tempx) > 0 and len(tempy) > 0:
-        z1 = np.polyfit(tempx, tempy, 1)
-        brow_k = -round(z1[0], 3)
-    else:
-        brow_k = 0
-
-    brow_hight = (brow_sum / 10) / face_width  # 眉毛高度占比
-    brow_width = (frown_sum / 5) / face_width  # 眉毛距离占比
-
-    # 眼睛睁开程度
-    eye_sum = (landmarks.part(41).y - landmarks.part(37).y + landmarks.part(40).y - landmarks.part(38).y +
-               landmarks.part(47).y - landmarks.part(43).y + landmarks.part(46).y - landmarks.part(44).y)
-    eye_hight = (eye_sum / 4) / face_width
-
-    # 鼻子皱起程度 (厌恶表情)
-    nose_wrinkling = (landmarks.part(31).y - landmarks.part(27).y) / face_height
-
-    return {
-        'mouth_width': mouth_width,
-        'mouth_higth': mouth_higth,
-        'brow_k': brow_k,
-        'brow_hight': brow_hight,
-        'brow_width': brow_width,
-        'eye_hight': eye_hight,
-        'nose_wrinkling': nose_wrinkling,
-        'mouth_core_width': mouth_core_width,
-        'mouth_core_hight': mouth_core_hight,
-        'eye_core_hight': eye_core_hight
-    }
-
-
-def classify_micro_expression(features):
-    # 惊讶 (眼睛睁大+嘴巴张大)
-    if (features['eye_core_hight'] >= thresholds['eye_core_hight']):
-        return "惊讶"
-    elif (features['mouth_higth'] >= thresholds['mouth_higth_amazing'] and
-          features['eye_hight'] >= thresholds['eye_hight_amazing']):
-        return "惊讶"
-
-    # 开心 (嘴巴张大但眼睛不一定)
-    elif features['mouth_core_width'] >= thresholds['mouth_core_width']:
-        return "开心"
-
-    # 愤怒 (眉毛内聚且下压)
-    elif features['brow_k'] <= thresholds['brow_k_angry']:
-        return "愤怒"
-
-    # 悲伤 (眉毛外角上扬)
-    elif features['mouth_core_hight'] >= thresholds['mouth_core_hight']:
-        return "悲伤"
-
-    # 厌恶 (鼻子皱起+眉毛压低)
-    elif (features['nose_wrinkling'] < 0.25):
-        return "厌恶"
-
-    # 恐惧 (眼睛睁大+眉毛上扬)
-    elif (features['eye_hight'] >= thresholds['eye_hight_fear'] and
-          features['brow_hight'] > 0.25):
-        return "恐惧"
-
-    # 默认自然表情
-    else:
-        return "自然"
-
-
-def get_combined_micro_expression():
-    if not micro_expression_window:
-        return "自然"
-
-    counts = {}
-    for me in micro_expression_window:
-        counts[me] = counts.get(me, 0) + 1
-
-    return max(counts, key=counts.get)
-
-
-def get_refined_emotion(main_emotion, micro_expression):
-    # 主表情与微表情的修正规则
-    combination_rules = {
-        # 中性表情组合
-        "neutral": {
-            "开心": "微笑",
-            "愤怒": "严肃",
-            "悲伤": "忧郁",
-            "惊讶": "好奇",
-            "厌恶": "不适",
-            "恐惧": "不安",
-            "自然": "中性"
-        },
-        # 开心组合
-        "happy": {
-            "开心": "开怀大笑",
-            "愤怒": "假笑",
-            "悲伤": "苦笑",
-            "惊讶": "惊喜",
-            "厌恶": "嘲讽",
-            "恐惧": "紧张的笑",
-            "自然": "微笑"
-        },
-        # 悲伤组合
-        "sad": {
-            "开心": "喜极而泣",
-            "愤怒": "愤懑",
-            "悲伤": "悲痛",
-            "惊讶": "震惊的悲伤",
-            "厌恶": "轻蔑",
-            "恐惧": "绝望",
-            "自然": "忧郁"
-        },
-        # 愤怒组合
-        "angry": {
-            "开心": "狞笑",
-            "愤怒": "暴怒",
-            "悲伤": "愤懑",
-            "惊讶": "震怒",
-            "厌恶": "憎恶",
-            "恐惧": "威胁",
-            "自然": "不悦"
-        },
-        # 惊讶组合
-        "surprise": {
-            "开心": "惊喜",
-            "愤怒": "震惊的愤怒",
-            "悲伤": "震惊的悲伤",
-            "惊讶": "极度惊讶",
-            "厌恶": "震惊的厌恶",
-            "恐惧": "惊恐",
-            "自然": "惊讶"
-        },
-        # 厌恶组合
-        "disgust": {
-            "开心": "讥笑",
-            "愤怒": "憎恶",
-            "悲伤": "厌恶的悲伤",
-            "惊讶": "震惊的厌恶",
-            "厌恶": "极度厌恶",
-            "恐惧": "恶心",
-            "自然": "轻微厌恶"
-        },
-        # 恐惧组合
-        "fear": {
-            "开心": "紧张的笑",
-            "愤怒": "恐惧的愤怒",
-            "悲伤": "恐惧的悲伤",
-            "惊讶": "惊恐",
-            "厌恶": "恐惧的厌恶",
-            "恐惧": "极度恐惧",
-            "自然": "不安"
-        }
-    }
-
-    # 确保主表情在规则中
-    main_emotion_lower = main_emotion.lower()
-    if main_emotion_lower not in combination_rules:
-        return main_emotion
-
-    # 获取对应规则
-    rules = combination_rules[main_emotion_lower]
-
-    # 如果微表情在规则中，返回组合结果
-    if micro_expression in rules:
-        return rules[micro_expression]
-
-    # 默认返回主表情
-    return main_emotion
-
-
-def get_confidence(main_emotion, micro_expression):
-    # 如果两种结果一致，置信度高
-    if (main_emotion == "happy" and micro_expression == "开心") or \
-            (main_emotion == "angry" and micro_expression == "愤怒") or \
-            (main_emotion == "sad" and micro_expression == "悲伤") or \
-            (main_emotion == "surprise" and micro_expression == "惊讶") or \
-            (main_emotion == "disgust" and micro_expression == "厌恶") or \
-            (main_emotion == "fear" and micro_expression == "恐惧"):
-        return "高置信度"
-
-    # 如果微表情是自然，使用主表情
-    if micro_expression == "自然":
-        return "中等置信度"
-
-    # 其他情况为中等或低置信度
-    return "低置信度"
-
-
 class EmotionDetectorCamera:
+    # 情感类别定义（英文和中文）
     EMOTION_CLASSES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
     EMOTION_CLASSES_ZH = ['愤怒', '厌恶', '恐惧', '开心', '悲伤', '惊讶', '平静']
+    MICRO_EXPRESSION_CLASSES = ['content', 'melancholy', 'irritated', 'curious', 'apprehensive', 'unimpressed',
+                                'moved', 'frustrated', 'delighted', 'amused', 'excited', 'smile', 'relieved',
+                                'resentful', 'touched', 'lonely', 'disappointed', 'passionate', 'gloomy',
+                                'outraged', 'threatening', 'hostile', 'amazed', 'shocked', 'alarmed',
+                                'panicked', 'appalled', 'thrilled', 'anxious', 'defensive', 'nervous',
+                                'repulsed', 'sarcastic', 'contempt', 'loathing', 'uncomfortable', 'revolted',
+                                'phobic', 'confident', 'suspicious', 'confused', 'playful', 'jealous',
+                                'embarrassed', 'expectant', 'regretful', 'charming', 'determined', 'desirous',
+                                'perplexed', 'eager', 'excited', 'nervous', 'alert', 'composed', 'pensive',
+                                'intoxicated', 'puzzled']
 
     def __init__(self,
                  detection_interval: float = 0.5,
                  use_chinese: bool = False,
                  callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+        """
+        初始化情感检测器
 
+        参数:
+            detection_interval: 检测间隔时间(秒)
+            use_chinese: 是否使用中文显示
+            callback: 检测结果回调函数
+        """
+        self.calibration_start_time = None
+        self.is_calibrating = False
+        self.calibration_complete = False
+        self.neutral_features = []
+        self.neutral_landmark_distances = None
+        self.in_micro_expression = False
+        self.last_macro_emotion_time = time.time()
+        # 新增微表情投票窗口
+        self.micro_expression_window = collections.deque(maxlen=5)  # 5帧窗口
+        self.current_stable_micro = None  # 当前稳定的微表情
+        self.calibration_duration = 3  # 3秒标定时间
         self.detection_interval = detection_interval
-        self.use_chinese = use_chinese  # 添加这一行
         self.callback = callback
         self.emotion_classes = self.EMOTION_CLASSES_ZH if use_chinese else self.EMOTION_CLASSES
         self.cap = None
@@ -305,41 +89,55 @@ class EmotionDetectorCamera:
             "probability": 0.0,
             "all_probabilities": {emotion: 0.0 for emotion in self.emotion_classes},
             "timestamp": time.time(),
-            "refined_emotion": "neutral",
-            "confidence": "高置信度" if use_chinese else "High confidence"
+            "micro_expression": None
         }
+        # 分心检测基线
+        self.eye_relative_baseline = None  # {'left': (x, y), 'right': (x, y)}
+        self.distracted = False
+        self.distract_start_time = None  # 分心计时起点
+        self.need_recalibration = False  # 标记是否需要重新标定
+        self.recalibration_start_time = None  # neutral重新计时
 
-        # 心跳检测相关变量
-        self.hr_signal_buffer = []
-        self.last_hr_update_time = 0
-        self.locked_hr_value = None
-        self.is_hr_calculating = False
-        self.hr_display = "Calculating HR..."
-        self.hr_history = []
+        # 初始化OpenCV人脸检测器
+        self.face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
 
-        # 字体路径检查
-        self.font_path = "simhei.ttf"
-        if use_chinese and not os.path.exists(self.font_path):
-            print(f"警告: 中文字体文件 {self.font_path} 不存在，将回退到英文显示")
-            self.use_chinese = False
+        # 初始化dlib面部关键点检测器
+        self.landmark_detector = dlib.shape_predictor("/home/liugezhi/下载/shape_predictor_68_face_landmarks.dat")
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.LEFT_EYE_INDICES = [33, 133, 159, 145, 153, 144, 160, 158]
+        self.RIGHT_EYE_INDICES = [362, 263, 386, 374, 380, 373, 387, 385]
+        self.LEFT_IRIS_INDICES = [468, 469, 470, 471, 472]
+        self.RIGHT_IRIS_INDICES = [473, 474, 475, 476, 477]
 
-        print(f"Camera emotion detector initialized, using device: {device}")
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(3, 480)
-
+        # 疲劳检测相关变量
+        self.eye_counter = 0
+        self.yawn_counter = 0
+        self.eye_closed = False
+        self.yawn_detected = False
+        self.fatigue_level = 0
+        # 临时文件路径
         self.TEMP_IMG_PATH = "temp_frame.jpg"
         self.last_valid_face_rect = None
-        self.demographics = {
-            "age": None,
-            "gender": None,
-            "gender_confidence": None,
-            "race": None,
-            "race_confidence": None
-        }
-        self.demographics_initialized = False
+
+        # rPPG心率检测相关变量
+        self.rppg_green_buffer = []  # 存储绿色通道均值
+        self.rppg_time_buffer = []   # 存储时间戳
+        self.rppg_buffer_size = 300  # 约10秒（30fps）
+        self.rppg_last_bpm = None
+        self.rppg_last_update = 0
+        self.rppg_update_interval = 2.0  # 每2秒更新一次心率
+
 
 
     def show_text(self, frame, text, position=(50, 50), color=(0, 255, 0), size=1.0):
+        """在帧上显示文本(支持中文)"""
         if self.emotion_classes == self.EMOTION_CLASSES_ZH:
             frame = cv2_putText_cn(frame, text, position, font_size=int(32 * size), color=color)
         else:
@@ -347,14 +145,15 @@ class EmotionDetectorCamera:
         return frame
 
     def start(self, camera_id: int = 0, show_video: bool = False):
+        """启动检测线程"""
         if self.is_running:
-            print("Emotion detection is already running")
+            print("情感检测已在运行中")
             return False
 
         try:
             self.cap = cv2.VideoCapture(camera_id)
             if not self.cap.isOpened():
-                print(f"Unable to open camera ID: {camera_id}")
+                print(f"无法打开摄像头 ID: {camera_id}")
                 return False
 
             self.is_running = True
@@ -364,17 +163,18 @@ class EmotionDetectorCamera:
                 daemon=True
             )
             self.detection_thread.start()
-            print(f"Emotion detection started successfully, using camera ID: {camera_id}")
+            print(f"情感检测已成功启动，使用摄像头 ID: {camera_id}")
             return True
 
         except Exception as e:
-            print(f"Failed to start emotion detection: {str(e)}")
+            print(f"启动情感检测失败: {str(e)}")
             self.is_running = False
             if self.cap is not None:
                 self.cap.release()
             return False
 
     def stop(self):
+        """停止检测"""
         if not self.is_running:
             return
 
@@ -384,317 +184,818 @@ class EmotionDetectorCamera:
         if self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
-        print("Emotion detection stopped")
+        print("情感检测已停止")
 
     def get_latest_emotion(self) -> Dict[str, Any]:
+        """获取最新检测结果"""
         with self.lock:
-            result = self.latest_result.copy()
-            result["heart_rate"] = self.locked_hr_value
-            return result
+            return self.latest_result.copy()
 
-    def _butter_bandpass_filter(self, data, lowcut=0.7, highcut=4.0, fs=30, order=5):
-        """带通滤波器，用于心率信号处理"""
-        nyq = 0.5 * fs
-        low = lowcut / nyq
-        high = highcut / nyq
-        b, a = butter(order, [low, high], btype='band')
-        y = filtfilt(b, a, data)
-        return y
 
-    def _update_hr_value(self):
-        """在子线程中计算心率"""
-        try:
-            if len(self.hr_signal_buffer) == HR_WINDOW_SIZE:
-                filtered = self._butter_bandpass_filter(self.hr_signal_buffer)
-                peaks, _ = find_peaks(filtered, distance=HR_FPS * 0.6)  # 至少间隔0.6秒
+    
 
-                if len(peaks) >= 2:
-                    new_hr = 60 / (np.mean(np.diff(peaks)) / HR_FPS)
-                    self.hr_history.append(new_hr)
 
-                    # 平滑处理
-                    if len(self.hr_history) > HR_SMOOTHING_WINDOW:
-                        self.hr_history.pop(0)
 
-                    self.locked_hr_value = np.mean(self.hr_history)
-                    self.hr_display = f"HR: {self.locked_hr_value:.1f} BPM"
-        finally:
-            self.is_hr_calculating = False
-            self.last_hr_update_time = time.time()
-            self.hr_signal_buffer = []  # 重置缓冲区
 
-    def _collect_hr_data(self, frame):
-        """采集心率数据但不计算"""
-        if self.last_valid_face_rect and not self.is_hr_calculating:
-            x, y, w, h = self.last_valid_face_rect
-            # 使用面部中央区域提高稳定性
-            roi = frame[y + h // 4:y + h * 3 // 4, x + w // 4:x + w * 3 // 4]
-            self.hr_signal_buffer.append(np.mean(roi[:, :, 1]))  # 绿色通道
+    def _extract_features(self, landmarks, face_rect):
+        """提取面部特征"""
+        face_width = face_rect.right() - face_rect.left()
+        face_height = face_rect.bottom() - face_rect.top()
 
-            # 当缓冲区满且到5秒间隔时触发计算
-            current_time = time.time()
-            if (len(self.hr_signal_buffer) >= HR_WINDOW_SIZE and
-                    current_time - self.last_hr_update_time >= HR_UPDATE_INTERVAL):
-                self.is_hr_calculating = True
-                threading.Thread(target=self._update_hr_value, daemon=True).start()
+        # 嘴巴特征
+        mouth_width = (landmarks.part(54).x - landmarks.part(48).x) / face_width
+        mouth_higth = (landmarks.part(59).x - landmarks.part(48).x) / face_width
+        mouth_core_width = (landmarks.part(59).x - landmarks.part(48).x) / face_width
+        mouth_core_hight = (landmarks.part(60).y - landmarks.part(48).y) / face_width
+        eye_core_hight = (landmarks.part(42).y - landmarks.part(22).y) / face_width
 
-    def _detection_loop(self, show_video: bool):
-        last_detection_time = 0
-        current_emotion = "neutral"
-        current_micro = "neutral"
-        refined_emotion = "neutral"
-        confidence = "High confidence"
+        # 眉毛特征
+        brow_sum = 0
+        frown_sum = 0
+        line_brow_x = []
+        line_brow_y = []
 
-        # Display parameters
-        font_scale = 0.6
-        text_color = (0, 0, 255)  # Red text
-        text_thickness = 1
-        line_height = 25
-        y_pos = 20  # Display at top
-        text_x = 10
+        for j in range(17, 21):
+            brow_sum += (landmarks.part(j).y - face_rect.top()) + (landmarks.part(j + 5).y - face_rect.top())
+            frown_sum += landmarks.part(j + 5).x - landmarks.part(j).x
+            line_brow_x.append(landmarks.part(j).x)
+            line_brow_y.append(landmarks.part(j).y)
 
-        # English version of combination rules
-        combination_rules = {
-            "neutral": {
-                "happy": "Slight Smile",
-                "angry": "Serious",
-                "sad": "Melancholy",
-                "surprise": "Curious",
-                "disgust": "Discomfort",
-                "fear": "Uneasy",
-                "neutral": "Neutral"
-            },
-            "happy": {
-                "happy": "Laughing",
-                "angry": "Fake Smile",
-                "sad": "Bitter Smile",
-                "surprise": "Pleasantly Surprised",
-                "disgust": "Mocking",
-                "fear": "Nervous Smile",
-                "neutral": "Smiling"
-            },
-            "sad": {
-                "happy": "Tears of Joy",
-                "angry": "Resentful",
-                "sad": "Grief",
-                "surprise": "Shocked Sadness",
-                "disgust": "Scorn",
-                "fear": "Despair",
-                "neutral": "Melancholy"
-            },
-            "angry": {
-                "happy": "Grin",
-                "angry": "Furious",
-                "sad": "Resentful",
-                "surprise": "Outraged",
-                "disgust": "Loathing",
-                "fear": "Threatening",
-                "neutral": "Displeased"
-            },
-            "surprise": {
-                "happy": "Delighted",
-                "angry": "Shocked Anger",
-                "sad": "Shocked Sadness",
-                "surprise": "Astonished",
-                "disgust": "Shocked Disgust",
-                "fear": "Terrified",
-                "neutral": "Surprised"
-            },
-            "disgust": {
-                "happy": "Sneer",
-                "angry": "Loathing",
-                "sad": "Disgusted Sadness",
-                "surprise": "Shocked Disgust",
-                "disgust": "Revolted",
-                "fear": "Nauseated",
-                "neutral": "Mild Disgust"
-            },
-            "fear": {
-                "happy": "Nervous Smile",
-                "angry": "Fearful Anger",
-                "sad": "Fearful Sadness",
-                "surprise": "Terrified",
-                "disgust": "Fearful Disgust",
-                "fear": "Terror",
-                "neutral": "Uneasy"
-            }
+        tempx = np.array(line_brow_x)
+        tempy = np.array(line_brow_y)
+        brow_k = -round(np.polyfit(tempx, tempy, 1)[0], 3) if len(tempx) > 0 else 0
+        brow_hight = (landmarks.part(43).y - landmarks.part(23).y) / face_width
+        brow_width = (frown_sum / 5) / face_width
+
+        # 眼睛特征
+        eye_sum = (landmarks.part(41).y - landmarks.part(37).y +
+                   landmarks.part(40).y - landmarks.part(38).y +
+                   landmarks.part(47).y - landmarks.part(43).y +
+                   landmarks.part(46).y - landmarks.part(44).y)
+        eye_hight = (eye_sum / 4) / face_width
+
+        # 鼻子特征
+        nose_wrinkling = (landmarks.part(31).y - landmarks.part(27).y) / face_height
+
+        left_eye_center = ((landmarks.part(36).x + landmarks.part(39).x) / 2,
+                           (landmarks.part(36).y + landmarks.part(39).y) / 2)
+        right_eye_center = ((landmarks.part(42).x + landmarks.part(45).x) / 2,
+                            (landmarks.part(42).y + landmarks.part(45).y) / 2)
+
+        # 计算左右嘴角
+        left_mouth = (landmarks.part(48).x, landmarks.part(48).y)
+        right_mouth = (landmarks.part(54).x, landmarks.part(54).y)
+
+        # 计算左右眉毛中心
+        left_brow_center = ((landmarks.part(17).x + landmarks.part(21).x) / 2,
+                            (landmarks.part(17).y + landmarks.part(21).y) / 2)
+        right_brow_center = ((landmarks.part(22).x + landmarks.part(26).x) / 2,
+                             (landmarks.part(22).y + landmarks.part(26).y) / 2)
+
+        # 计算对称性误差
+        face_width = face_rect.right() - face_rect.left()
+        face_height = face_rect.bottom() - face_rect.top()
+
+        # 水平对称性 (y坐标差异)
+        eye_y_diff = abs(left_eye_center[1] - right_eye_center[1]) / face_height
+        brow_y_diff = abs(left_brow_center[1] - right_brow_center[1]) / face_height
+        mouth_y_diff = abs(left_mouth[1] - right_mouth[1]) / face_height
+
+        # 垂直对称性 (x坐标相对于面部中心的差异)
+        face_center_x = face_rect.left() + face_width / 2
+        left_eye_x_diff = abs((left_eye_center[0] - face_center_x) - (face_center_x - right_eye_center[0])) / face_width
+        left_brow_x_diff = abs((left_brow_center[0] - face_center_x) - (face_center_x - right_brow_center[0])) / face_width
+        left_mouth_x_diff = abs((left_mouth[0] - face_center_x) - (face_center_x - right_mouth[0])) / face_width
+
+        return {
+            'eye_y_diff': eye_y_diff,
+            'brow_y_diff': brow_y_diff,
+            'mouth_y_diff': mouth_y_diff,
+            'left_eye_x_diff': left_eye_x_diff,
+            'left_brow_x_diff': left_brow_x_diff,
+            'left_mouth_x_diff': left_mouth_x_diff,
+            'mouth_width': mouth_width,
+            'mouth_higth': mouth_higth,
+            'brow_k': brow_k,
+            'brow_hight': brow_hight,
+            'brow_width': brow_width,
+            'eye_hight': eye_hight,
+            'nose_wrinkling': nose_wrinkling,
+            'mouth_core_width': mouth_core_width,
+            'mouth_core_hight': mouth_core_hight,
+            'eye_core_hight': eye_core_hight
         }
 
-        def get_refined_emotion_en(main_emotion, micro_expression):
-            main_emotion_lower = main_emotion.lower()
-            if main_emotion_lower not in combination_rules:
-                return main_emotion
-            return combination_rules[main_emotion_lower].get(micro_expression, main_emotion)
+    def _detect_micro_expression(self, current_landmark_distances):
+        """检测微表情"""
+        if self.neutral_landmark_distances is None or current_landmark_distances is None:
+            return None
 
-        def get_confidence_en(main_emotion, micro_expression):
-            if (main_emotion == "happy" and micro_expression == "happy") or \
-                    (main_emotion == "angry" and micro_expression == "angry") or \
-                    (main_emotion == "sad" and micro_expression == "sad") or \
-                    (main_emotion == "surprise" and micro_expression == "surprise") or \
-                    (main_emotion == "disgust" and micro_expression == "disgust") or \
-                    (main_emotion == "fear" and micro_expression == "fear"):
-                return "High confidence"
-            if micro_expression == "neutral":
-                return "Medium confidence"
-            return "Low confidence"
+        # 计算特征变化
+        changes = {}
+        for name, current_val in current_landmark_distances.items():
+            neutral_val = self.neutral_landmark_distances.get(name, 0)
+            if neutral_val != 0:
+                changes[name] = (current_val - neutral_val) / neutral_val * 100  # 百分比变化
+        micro_expression = None
+        # 根据特征变化判断微表情
+
+        if changes.get('brow_hight', 0) < -15:  # 眉毛下垂超过15%
+            primary = "angry"
+        elif abs(changes.get('eye_hight', 0)) > 30:  # 眼睛变化超过30%
+            primary = "fear"
+        elif changes.get('nose_wrinkling', 0) > 5:  # 鼻子皱起超过5%
+            primary = "disgust"
+        elif changes.get('brow_hight', 0) > 8.5:  # 眉毛上扬超过8.5%
+            primary = "surprise"
+        elif changes.get('mouth_higth', 0) > 5:  # 嘴角上扬超过5%
+            primary = "happy"
+        elif changes.get('mouth_core_hight', 0)  >30:  # 嘴角下垂超过-8%
+            primary = "sad"
+        else:
+            primary = "neutral"
+
+        # 检测次要表情
+        secondary = "neutral"
+        if abs(changes.get('eye_hight', 0)) > 40 and primary != "fear":
+            secondary = "fear"
+        elif changes.get('nose_wrinkling', 0) > 4 and primary != "disgust":
+            secondary = "disgust"
+        elif changes.get('brow_hight', 0) > 10 and primary != "surprise":
+            secondary = "surprise"
+        elif changes.get('mouth_higth', 0) > 7 and primary != "happy":
+            secondary = "happy"
+        elif changes.get('mouth_core_hight', 0) >30 and primary != "sad":
+            secondary = "sad"
+        elif changes.get('brow_hight', 0) < -20 and primary != "angry":
+            secondary = "angry"
+
+        # 组合表情判断 (按照优先级排序)
+        if primary == "happy" and secondary == "sad":
+            micro_expression = "moved"
+        elif primary == "happy" and secondary == "angry":
+            micro_expression = "frustrated"
+        elif primary == "happy" and secondary == "surprise":
+            micro_expression = "delighted"
+        elif primary == "happy" and secondary == "disgust":
+            micro_expression = "amused"
+        elif primary == "happy" and secondary == "fear":
+            micro_expression = "excited"
+        elif primary == "happy" and secondary == "neutral":
+            micro_expression = "smile"
+        elif primary == "sad" and secondary == "happy":
+            micro_expression = "relieved"
+        elif primary == "sad" and secondary == "angry":
+            micro_expression = "resentful"
+        elif primary == "sad" and secondary == "surprise":
+            micro_expression = "touched"
+        elif primary == "sad" and secondary == "neutral":
+            micro_expression = "sad"
+        elif primary == "sad" and secondary == "fear":
+            micro_expression = "lonely"
+        elif primary == "sad" and secondary == "disgust":
+            micro_expression = "disappointed"
+        elif primary == "angry" and secondary == "happy":
+            micro_expression = "passionate"
+        elif primary == "angry" and secondary == "sad":
+            micro_expression = "gloomy"
+        elif primary == "angry" and secondary == "neutral":
+            micro_expression = "angry"
+        elif primary == "angry" and secondary == "surprise":
+            micro_expression = "outraged"
+        elif primary == "angry" and secondary == "fear":
+            micro_expression = "threatening"
+        elif primary == "angry" and secondary == "disgust":
+            micro_expression = "hostile"
+        elif primary == "surprise" and secondary == "happy":
+            micro_expression = "amazed"
+        elif primary == "surprise" and secondary == "sad":
+            micro_expression = "shocked"
+        elif primary == "surprise" and secondary == "angry":
+            micro_expression = "alarmed"
+        elif primary == "surprise" and secondary == "neutral":
+            micro_expression = "curious"
+        elif primary == "surprise" and secondary == "fear":
+            micro_expression = "panicked"
+        elif primary == "surprise" and secondary == "disgust":
+            micro_expression = "appalled"
+        elif primary == "fear" and secondary == "happy":
+            micro_expression = "thrilled"
+        elif primary == "fear" and secondary == "sad":
+            micro_expression = "anxious"
+        elif primary == "fear" and secondary == "angry":
+            micro_expression = "defensive"
+        elif primary == "fear" and secondary == "neutral":
+            micro_expression = "nervous"
+        elif primary == "fear" and secondary == "surprise":
+            micro_expression = "terrified"
+        elif primary == "fear" and secondary == "disgust":
+            micro_expression = "repulsed"
+        elif primary == "disgust" and secondary == "happy":
+            micro_expression = "sarcastic"
+        elif primary == "disgust" and secondary == "sad":
+            micro_expression = "contempt"
+        elif primary == "disgust" and secondary == "angry":
+            micro_expression = "loathing"
+        elif primary == "disgust" and secondary == "neutral":
+            micro_expression = "uncomfortable"
+        elif primary == "disgust" and secondary == "surprise":
+            micro_expression = "revolted"
+        elif primary == "disgust" and secondary == "fear":
+            micro_expression = "phobic"
+        elif primary == "neutral" and secondary == "happy":
+            micro_expression = "content"
+        elif primary == "neutral" and secondary == "sad":
+            micro_expression = "melancholy"
+        elif primary == "neutral" and secondary == "angry":
+            micro_expression = "irritated"
+        elif primary == "neutral" and secondary == "surprise":
+            micro_expression = "curious"
+        elif primary == "neutral" and secondary == "fear":
+            micro_expression = "apprehensive"
+        elif primary == "neutral" and secondary == "disgust":
+            micro_expression = "unimpressed"
+        else:
+            micro_expression = primary  # 如果没有匹配的组合，返回主表情
+
+        if (changes.get('eye_hight', 0) > 20) and (changes.get('brow_hight', 0) > 10):
+            micro_expression = "curious"
+        # 自信 - 眼睛开合增加15%-25%，口角上扬3%-5%，眉毛变化不大
+        elif (15 <= changes.get('eye_hight', 0) <= 25) and (3 <= changes.get('mouth_higth', 0) <= 5):
+            micro_expression = "confident"
+        # 怀疑 - 眉毛上扬>15%，口角下垂>=-3%，眼睛开合变化不大
+        elif (changes.get('brow_hight', 0) > 15) and (changes.get('mouth_higth', 0) <= -3):
+            micro_expression = "suspicious"
+        elif (changes.get('brow_hight', 0) < -10) and (changes.get('mouth_hight', 0) > 2) and (abs(changes.get('eye_hight', 0)) < 10):
+            micro_expression = "confused"
+        # 调皮
+        elif (changes.get('eye_hight', 0) <= 10) and (changes.get('mouth_hight', 0) > 5) and (changes.get('brow_hight', 0) <= 5) and (abs(changes.get('mouth_edge_distance', 0)) < 2):
+            micro_expression = "playful"
+        # 嫉妒
+        elif (changes.get('eye_hight', 0) < -10) and (changes.get('mouth_hight', 0) < -5) and (changes.get('brow_hight', 0) > 8) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "jealous"
+        # 尴尬
+        elif (abs(changes.get('eye_hight', 0)) < 10) and (abs(changes.get('mouth_hight', 0)) < 5) and (changes.get('brow_hight', 0) < -15) and (changes.get('nose_bridge_hight', 0) > 5):
+            micro_expression = "embarrassed"
+        # 期待
+        elif (changes.get('brow_hight', 0) > 15) and (abs(changes.get('mouth_hight', 0)) < 5) and (changes.get('eye_hight', 0) > 20) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "expectant"
+        # 后悔
+        elif (changes.get('brow_hight', 0) < -15) and (changes.get('mouth_hight', 0) < -5) and (changes.get('eye_hight', 0) < -10) and (changes.get('brow_inner_distance', 0) > 5):
+            micro_expression = "regretful"
+        # 魅力
+        elif (changes.get('eye_hight', 0) <= 15) and (3 <= changes.get('mouth_hight', 0) <= 5) and (changes.get('brow_hight', 0) <= 8) and (changes.get('eyelid_hight', 0) <= 5):
+            micro_expression = "charming"
+        # 坚定
+        elif (changes.get('brow_hight', 0) < -10) and (changes.get('mouth_hight', 0) <= 3) and (changes.get('eye_hight', 0) <= 5) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "determined"
+        # 渴望
+        elif (changes.get('eye_hight', 0) > 25) and (changes.get('mouth_hight', 0) > 5) and (changes.get('brow_hight', 0) <= 10) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "desirous"
+        # 迷惑
+        elif (changes.get('brow_hight', 0) < -15) and (changes.get('mouth_open', 0) > 5) and (abs(changes.get('eye_hight', 0)) < 10):
+            micro_expression = "perplexed"
+        # 急切
+        elif (10 <= changes.get('brow_hight', 0) <= 15) and (changes.get('mouth_hight', 0) > 5) and (changes.get('eye_hight', 0) > 30) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "eager"
+        # 激动
+        elif (changes.get('eye_hight', 0) > 40) and (changes.get('mouth_hight', 0) > 10) and (changes.get('brow_hight', 0) > 15) and (changes.get('eyelid_hight', 0) <= 5):
+            micro_expression = "excited"
+        # 紧张
+        elif (changes.get('eye_hight', 0) <= 25) and (changes.get('mouth_hight', 0) < -5) and (changes.get('brow_hight', 0) > 8) and (changes.get('eyelid_hight', 0) < -10):
+            micro_expression = "nervous"
+        # 警觉
+        elif (changes.get('eye_hight', 0) > 50) and (changes.get('brow_hight', 0) > 20) and (changes.get('mouth_open', 0) > 10) and (changes.get('eyelid_hight', 0) <= 10):
+            micro_expression = "alert"
+        # 从容
+        elif (changes.get('brow_hight', 0) < -10) and (abs(changes.get('mouth_hight', 0)) < 3) and (abs(changes.get('eye_hight', 0)) < 10) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "composed"
+        # 沉思
+        elif (changes.get('brow_hight', 0) < -15) and (abs(changes.get('mouth_hight', 0)) < 5) and (abs(changes.get('eye_hight', 0)) < 10) and (changes.get('eyelid_hight', 0) < -10):
+            micro_expression = "pensive"
+        # 陶醉
+        elif (changes.get('eye_hight', 0) > 30) and (changes.get('mouth_hight', 0) > 15) and (changes.get('brow_hight', 0) > 10) and (changes.get('eyelid_hight', 0) < -10):
+            micro_expression = "intoxicated"
+        # 迷惑
+        elif (changes.get('brow_hight', 0) > 8) and (abs(changes.get('mouth_hight', 0)) < 3) and (abs(changes.get('eye_hight', 0)) < 10) and (changes.get('eyelid_hight', 0) < -5):
+            micro_expression = "puzzled"
+        return micro_expression
+
+    def _detection_loop(self, show_video: bool):
+        """检测主循环（整合68点关键点绘制）"""
+        last_detection_time = 0
+        current_emotion = "neutral"
+        current_micro_expression = None
+        last_calibration_data = None  # 保存上次成功的标定数据
+
+        # 虹膜检测相关变量
+        left_iris_ellipse = None
+        right_iris_ellipse = None
+        left_eye_ellipse = None
+        right_eye_ellipse = None
+
+        # 疲劳检测相关变量
+        eye_ratio_threshold = 0.1  # 眼睛横纵比阈值，小于此值认为闭眼
+        mouth_ratio_threshold = 0.9  # 嘴巴横纵比阈值，大于此值认为打哈欠
+        eye_closed_frames = 0  # 连续闭眼帧数
+        yawn_frames = 0  # 连续打哈欠帧数
+        fatigue_warning = False  # 疲劳警告状态
+
+        # 显示参数配置
+        font_scale = 0.6  # 字体大小
+        text_color = (0, 0, 255)  # 文字颜色(红色)
+        text_thickness = 1  # 文字粗细
+        line_height = 25  # 行间距
+        text_x = 10  # 起始x坐标
 
         while self.is_running and self.cap is not None:
             ret, frame = self.cap.read()
             if not ret:
-                print("Failed to get video frame")
+                print("无法获取视频帧")
                 break
-
+            frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420) if frame.shape[-1] != 3 else frame
             current_time = time.time()
             display_frame = frame.copy()
 
-            # 1. Collect HR data (every frame)
-            self._collect_hr_data(frame)
+            # 在画面底部显示状态信息
+            y_pos = display_frame.shape[0] - 50
+            # 只在自然表情时显示微表情作为主要情感
+            if current_emotion == "neutral" and current_micro_expression:
+                final_emotion_display = current_micro_expression
+                cv2.putText(display_frame, f"Emotion: {final_emotion_display}",
+                            (text_x, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+                # 显示基础情感作为参考
+                cv2.putText(display_frame, f"Base: {current_emotion}",
+                            (text_x, y_pos - line_height),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), text_thickness)
+            else:
+                # 非自然表情时，直接显示主要情感
+                cv2.putText(display_frame, f"Emotion: {current_emotion}",
+                            (text_x, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
 
-            # 2. Display information (top of frame)
-            hr_value = int(self.locked_hr_value) if self.locked_hr_value is not None else "Calculating"
+            # 使用OpenCV检测人脸
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(100, 100)
+            )
 
-            cv2.putText(display_frame, f"Emotion: {current_emotion}",
-                        (text_x, y_pos), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
-            cv2.putText(display_frame, f"Micro: {current_micro}",
-                        (text_x, y_pos + line_height), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
-            cv2.putText(display_frame, f"Refined: {refined_emotion}",
-                        (text_x, y_pos + 2 * line_height), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
-            cv2.putText(display_frame, f"Confidence: {confidence}",
-                        (text_x, y_pos + 3 * line_height), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
-            cv2.putText(display_frame, f"Heart Rate: {hr_value}",
-                        (text_x, y_pos + 4 * line_height), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, text_thickness)
+            if len(faces) > 0:
+                # 选择最大的人脸
+                main_face = max(faces, key=lambda f: f[2] * f[3])
+                x, y, w, h = main_face
+                self.last_valid_face_rect = (x, y, w, h)
 
-            # 3. Face detection and drawing
-            if self.last_valid_face_rect:
-                x, y, w_rect, h_rect = self.last_valid_face_rect
-                cv2.rectangle(display_frame, (x, y), (x + w_rect, y + h_rect), (0, 255, 0), 2)
+                # 裁剪人脸区域
+                face_img = frame[y:y + h, x:x + w]
 
-            # 4. Emotion detection (timed)
+                # rPPG心率检测：提取绿色通道均值
+                face_roi = frame[y:y + h, x:x + w]
+                if face_roi.size > 0:
+                    green_mean = np.mean(face_roi[:, :, 1])
+                    self.rppg_green_buffer.append(green_mean)
+                    self.rppg_time_buffer.append(current_time)
+                    # 保持缓冲区长度
+                    if len(self.rppg_green_buffer) > self.rppg_buffer_size:
+                        self.rppg_green_buffer = self.rppg_green_buffer[-self.rppg_buffer_size:]
+                        self.rppg_time_buffer = self.rppg_time_buffer[-self.rppg_buffer_size:]
+
+                # rPPG心率估算
+                if len(self.rppg_green_buffer) >= int(self.rppg_buffer_size * 0.8):
+                    if current_time - self.rppg_last_update > self.rppg_update_interval:
+                        # 去均值
+                        signal = np.array(self.rppg_green_buffer)
+                        signal = signal - np.mean(signal)
+                        # 采样率
+                        duration = self.rppg_time_buffer[-1] - self.rppg_time_buffer[0]
+                        if duration > 0:
+                            fps = len(self.rppg_time_buffer) / duration
+                            # FFT
+                            freqs = np.fft.rfftfreq(len(signal), d=1.0/fps)
+                            fft = np.abs(np.fft.rfft(signal))
+                            # 心率范围（0.8Hz-3Hz, 48-180bpm）
+                            mask = (freqs >= 0.8) & (freqs <= 3.0)
+                            if np.any(mask):
+                                peak_freq = freqs[mask][np.argmax(fft[mask])]
+                                bpm = int(peak_freq * 60)
+                                self.rppg_last_bpm = bpm
+                                self.rppg_last_update = current_time
+
+                # 持续进行关键点检测和绘制
+                if self.landmark_detector:
+                    # 转换为灰度图
+                    gray_roi = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+                    dlib_rect = dlib.rectangle(0, 0, gray_roi.shape[1], gray_roi.shape[0])
+
+                    # 检测关键点
+                    landmarks = self.landmark_detector(gray_roi, dlib_rect)
+
+                    # 绘制所有68个关键点
+                    for i in range(68):
+                        point = (landmarks.part(i).x + x, landmarks.part(i).y + y)
+                        cv2.circle(display_frame, point, 2, (0, 255, 255), -1)
+
+                    # 绘制关键区域连线
+                    # 下巴线（0-16）
+                    for i in range(16):
+                        cv2.line(display_frame,
+                                 (landmarks.part(i).x + x, landmarks.part(i).y + y),
+                                 (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y),
+                                 (255, 0, 0), 1)
+
+                    # 左眉毛（17-21）
+                    for i in range(17, 21):
+                        cv2.line(display_frame,
+                                 (landmarks.part(i).x + x, landmarks.part(i).y + y),
+                                 (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y),
+                                 (0, 255, 0), 1)
+
+                    # 右眉毛（22-26）
+                    for i in range(22, 26):
+                        cv2.line(display_frame,
+                                 (landmarks.part(i).x + x, landmarks.part(i).y + y),
+                                 (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y),
+                                 (0, 255, 0), 1)
+
+                    # 鼻子（27-35）
+                    for i in range(27, 35):
+                        cv2.line(display_frame,
+                                 (landmarks.part(i).x + x, landmarks.part(i).y + y),
+                                 (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y),
+                                 (0, 0, 255), 1)
+
+                    # 外唇（48-59）
+                    for i in range(48, 60):
+                        start = (landmarks.part(i).x + x, landmarks.part(i).y + y)
+                        end = (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y) if i < 59 else (landmarks.part(48).x + x, landmarks.part(48).y + y)
+                        cv2.line(display_frame, start, end, (0, 255, 255), 1)
+
+                    # 内唇（60-67）
+                    for i in range(60, 68):
+                        start = (landmarks.part(i).x + x, landmarks.part(i).y + y)
+                        end = (landmarks.part(i + 1).x + x, landmarks.part(i + 1).y + y) if i < 67 else (landmarks.part(60).x + x, landmarks.part(60).y + y)
+                        cv2.line(display_frame, start, end, (255, 0, 255), 1)
+
+                    # 疲劳检测：计算眼睛和嘴巴的横纵比
+                    # 左眼横纵比 (36-39, 37-38)
+                    left_eye_width = abs(landmarks.part(39).x - landmarks.part(36).x)
+                    left_eye_height = abs(landmarks.part(37).y - landmarks.part(41).y)
+                    left_eye_ratio = left_eye_height / left_eye_width if left_eye_width > 0 else 0
+
+                    # 右眼横纵比 (42-45, 43-44)
+                    right_eye_width = abs(landmarks.part(45).x - landmarks.part(42).x)
+                    right_eye_height = abs(landmarks.part(43).y - landmarks.part(47).y)
+                    right_eye_ratio = right_eye_height / right_eye_width if right_eye_width > 0 else 0
+
+                    # 嘴巴横纵比 (48-54, 51-57)
+                    mouth_width = abs(landmarks.part(54).x - landmarks.part(48).x)
+                    mouth_height = abs(landmarks.part(51).y - landmarks.part(57).y)
+                    mouth_ratio = mouth_height / mouth_width if mouth_width > 0 else 0
+
+                    # 判断闭眼
+                    eyes_closed = (left_eye_ratio < eye_ratio_threshold) or (right_eye_ratio < eye_ratio_threshold)
+                    if eyes_closed:
+                        eye_closed_frames += 1
+                    else:
+                        eye_closed_frames = 0
+
+                    # 判断打哈欠
+                    is_yawn = mouth_ratio > mouth_ratio_threshold
+                    if is_yawn:
+                        yawn_frames += 1
+                    else:
+                        yawn_frames = 0
+
+                    # 疲劳警告逻辑
+                    if eye_closed_frames >= 10 or yawn_frames >= 5:  # 连续闭眼10帧或打哈欠5帧
+                        fatigue_warning = True
+                    else:
+                        fatigue_warning = False
+
+                    # 自然状态标定逻辑
+                    if not self.calibration_complete:
+                        if not self.is_calibrating and current_emotion == "neutral":
+                            print("请保持自然表情3秒进行标定...")
+                            self.is_calibrating = True
+                            self.calibration_start_time = current_time
+                            self.neutral_features = []  # 重置标定数据
+
+                        if self.is_calibrating:
+                            if current_emotion != "neutral":
+                                print("检测到非中性表情，标定中断！")
+                                self.is_calibrating = False
+                            elif current_time - self.calibration_start_time < self.calibration_duration:
+                                # 收集中性状态特征
+                                features = self._extract_features(landmarks, dlib_rect)
+                                self.neutral_features.append(features)
+                                # 显示标定倒计时
+                                remaining = int(self.calibration_duration - (current_time - self.calibration_start_time))
+                                cv2.putText(display_frame, f"Calibrating... {remaining}s",
+                                            (x, y - 50),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                            else:
+                                # 标定完成，计算中性状态特征平均值
+                                self.is_calibrating = False
+                                self.calibration_complete = True
+
+                                # 计算各特征的平均值
+                                avg_features = {}
+                                for key in self.neutral_features[0].keys():
+                                    avg_features[key] = sum(f[key] for f in self.neutral_features) / len(self.neutral_features)
+
+                                self.neutral_landmark_distances = avg_features
+                                last_calibration_data = avg_features  # 保存本次标定数据
+                                print("标定完成！中性状态特征已保存。")
+                    else:
+                        # 标定完成后，检测是否需要重新标定
+                        if self.calibration_complete:
+                            if current_emotion != "neutral":
+                                self.need_recalibration = True
+                                self.recalibration_start_time = None
+                            elif self.need_recalibration and current_emotion == "neutral":
+                                if self.recalibration_start_time is None:
+                                    self.recalibration_start_time = current_time
+                                elif current_time - self.recalibration_start_time >= self.calibration_duration:
+                                    # 重新标定
+                                    print("检测到回到自然表情，自动重新标定...")
+                                    self.calibration_complete = False
+                                    self.is_calibrating = True
+                                    self.need_recalibration = False
+                                    self.calibration_start_time = current_time
+                                    self.neutral_features = []
+                            else:
+                                self.recalibration_start_time = None
+                        # 标定完成后进行微表情检测
+                        # 不再因表情变化重置标定，分心检测始终有效
+                        # if current_emotion != "neutral":
+                        #     self.calibration_complete = False
+                        #     self.is_calibrating = False
+                        #     print("检测到非中性表情，已重置标定状态！")
+                        # else:
+                        #     # 标定完成后进行微表情检测
+                        #     current_features = self._extract_features(landmarks, dlib_rect)
+                        #     detected_micro = self._detect_micro_expression(current_features)
+                        #
+                        #     if detected_micro is not None:
+                        #         self.micro_expression_window.append(detected_micro)
+                        #
+                        #         # 统计窗口中最频繁的微表情
+                        #         if len(self.micro_expression_window) > 0:
+                        #             micro_counts = collections.Counter(self.micro_expression_window)
+                        #             most_common = micro_counts.most_common(1)[0]
+                        #             if most_common[1] >= 3:  # 至少出现3次才认为是稳定的微表情
+                        #                 self.current_stable_micro = most_common[0]
+                        #             else:
+                        #                 self.current_stable_micro = None
+                        #
+                        #     current_micro_expression = self.current_stable_micro
+                        # 微表情检测逻辑 - 只在自然表情时检测
+                        if current_emotion == "neutral":
+                            current_features = self._extract_features(landmarks, dlib_rect)
+                            detected_micro = self._detect_micro_expression(current_features)
+                            if detected_micro is not None:
+                                self.micro_expression_window.append(detected_micro)
+                                if len(self.micro_expression_window) > 0:
+                                    micro_counts = collections.Counter(self.micro_expression_window)
+                                    most_common = micro_counts.most_common(1)[0]
+                                    if most_common[1] >= 3:
+                                        self.current_stable_micro = most_common[0]
+                                    else:
+                                        self.current_stable_micro = None
+                            current_micro_expression = self.current_stable_micro
+                        else:
+                            # 非自然表情时，清空微表情检测
+                            self.micro_expression_window.clear()
+                            self.current_stable_micro = None
+                            current_micro_expression = None
+
+            # 定时执行情感检测
             if current_time - last_detection_time >= self.detection_interval:
                 try:
-                    cv2.imwrite(self.TEMP_IMG_PATH, frame)
-                    face_objs = DeepFace.extract_faces(
-                        img_path=self.TEMP_IMG_PATH,
-                        detector_backend="ssd",
-                        enforce_detection=False,
-                        align=False
-                    )
+                    if len(faces) > 0:
+                        # 分析情感（跳过检测步骤）
+                        results = DeepFace.analyze(
+                            img_path=face_img,
+                            actions=["emotion"],
+                            detector_backend="skip",
+                            enforce_detection=False,
+                            silent=True
+                        )
 
-                    if face_objs:
-                        main_face = max(face_objs, key=lambda x: x["facial_area"]["w"] * x["facial_area"]["h"])
-                        face_area = main_face["facial_area"]
-                        self.last_valid_face_rect = (face_area["x"], face_area["y"], face_area["w"], face_area["h"])
+                        if results:
+                            # 应用情感偏置权重
+                            raw_emotions = results[0]["emotion"]
+                            biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
+                            emotion_window.append(biased_emotions)
 
-                        # Save face region for analysis
-                        face_img = frame[face_area["y"]:face_area["y"] + face_area["h"],
-                                   face_area["x"]:face_area["x"] + face_area["w"]]
-                        cv2.imwrite(self.TEMP_IMG_PATH, face_img)
+                            # 计算多帧平均情感分数
+                            combined_scores = {}
+                            for e in emotion_window:
+                                for emo, score in e.items():
+                                    combined_scores[emo] = combined_scores.get(emo, 0) + score
+                            for emo in combined_scores:
+                                combined_scores[emo] /= len(emotion_window)
 
-                        # 68-point feature detection
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        faces_dlib = detector_dlib(gray)
-                        current_micro = "neutral"
+                            # 确定当前主要情感
+                            current_emotion = max(combined_scores, key=combined_scores.get)
 
-                        for face in faces_dlib:
-                            landmarks = predictor(gray, face)
-                            features = extract_features(landmarks, face)
-                            micro_expression = classify_micro_expression(features)
-                            # Convert to English
-                            micro_expression = {
-                                "自然": "neutral",
-                                "开心": "happy",
-                                "愤怒": "angry",
-                                "悲伤": "sad",
-                                "惊讶": "surprise",
-                                "厌恶": "disgust",
-                                "恐惧": "fear"
-                            }.get(micro_expression, micro_expression)
-                            micro_expression_window.append(micro_expression)
-                            current_micro = max(set(micro_expression_window), key=micro_expression_window.count)
-
-                        # Main emotion analysis
-                        if not self.demographics_initialized:
-                            results = DeepFace.analyze(
-                                img_path=self.TEMP_IMG_PATH,
-                                actions=["emotion", "age", "gender", "race"],
-                                detector_backend="skip",
-                                enforce_detection=False,
-                                silent=True
-                            )
-                            if results:
-                                r = results[0]
-                                self.demographics["age"] = int(r["age"])
-                                self.demographics["gender"] = r["dominant_gender"]
-                                self.demographics["gender_confidence"] = r["gender"][r["dominant_gender"]]
-                                self.demographics["race"] = r["dominant_race"]
-                                self.demographics["race_confidence"] = r["race"][r["dominant_race"]]
-                                self.demographics_initialized = True
-
-                                raw_emotions = r["emotion"]
-                                biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
-                                emotion_window.append(biased_emotions)
-                                current_emotion = max(biased_emotions, key=biased_emotions.get)
+                        # 更新最新结果 - 只在自然表情时使用微表情作为最终结果
+                        if current_emotion == "neutral" and current_micro_expression:
+                            final_emotion = current_micro_expression
                         else:
-                            results = DeepFace.analyze(
-                                img_path=self.TEMP_IMG_PATH,
-                                actions=["emotion"],
-                                detector_backend="skip",
-                                enforce_detection=False,
-                                silent=True
-                            )
-                            if results:
-                                raw_emotions = results[0]["emotion"]
-                                biased_emotions = {emo: raw_emotions[emo] * bias_weights.get(emo, 1.0) for emo in raw_emotions}
-                                emotion_window.append(biased_emotions)
-
-                                combined_scores = {}
-                                for e in emotion_window:
-                                    for emo, score in e.items():
-                                        combined_scores[emo] = combined_scores.get(emo, 0) + score
-                                for emo in combined_scores:
-                                    combined_scores[emo] /= len(emotion_window)
-
-                                current_emotion = max(combined_scores, key=combined_scores.get)
-
-                        # Combine results using English rules
-                        refined_emotion = get_refined_emotion_en(current_emotion, current_micro)
-                        confidence = get_confidence_en(current_emotion, current_micro)
-
-                        # Update results
+                            final_emotion = current_emotion
+                        
                         with self.lock:
                             self.latest_result = {
-                                "emotion": current_emotion,
-                                "emotion_index": self.EMOTION_CLASSES.index(current_emotion.capitalize()) if current_emotion.capitalize() in self.EMOTION_CLASSES else 6,
+                                "emotion": final_emotion,
+                                "emotion_index": self.EMOTION_CLASSES.index(current_emotion) if current_emotion in self.EMOTION_CLASSES else 6,
                                 "probability": 1.0,
-                                "all_probabilities": {emo: 1.0 if emo.lower() == current_emotion.lower() else 0.0 for emo in self.EMOTION_CLASSES},
+                                "all_probabilities": {emo: 1.0 if emo.lower() == final_emotion.lower() else 0.0 for emo in self.emotion_classes},
                                 "timestamp": time.time(),
-                                "heart_rate": int(self.locked_hr_value) if self.locked_hr_value is not None else None,
-                                "demographics": self.demographics.copy(),
-                                "micro_expression": current_micro,
-                                "refined_emotion": refined_emotion,
-                                "confidence": confidence
+                                "micro_expression": current_micro_expression
                             }
                             if self.callback:
                                 self.callback(self.latest_result)
 
-                        last_detection_time = current_time
-
-                    if os.path.exists(self.TEMP_IMG_PATH):
-                        os.remove(self.TEMP_IMG_PATH)
+                    last_detection_time = current_time
 
                 except Exception as e:
-                    print(f"Detection failed: {e}")
-                    if os.path.exists(self.TEMP_IMG_PATH):
-                        os.remove(self.TEMP_IMG_PATH)
+                    print(f"检测失败: {e}")
 
-            # 5. Display video
+            # 绘制人脸矩形框（保留原有逻辑）
+            if self.last_valid_face_rect:
+                x, y, w_rect, h_rect = self.last_valid_face_rect
+                cv2.rectangle(display_frame, (x, y), (x + w_rect, y + h_rect), (0, 255, 0), 2)
+                text_y_start = 30
+                line_height = 30
+                font_scale = 0.7
+                thickness = 2
+                # 显示情感标签
+                if current_emotion == "neutral" and current_micro_expression:
+                    # 自然表情时显示微表情作为主要标签
+                    emotion_text = f"{current_micro_expression}"
+                    text_size = cv2.getTextSize(emotion_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    text_x_pos = x + (w_rect - text_size[0]) // 2
+                    cv2.putText(display_frame, emotion_text,
+                                (text_x_pos, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # 显示基础情感作为参考
+                    base_text = f"Base: {current_emotion}"
+                    text_size = cv2.getTextSize(base_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                    text_x_pos = x + (w_rect - text_size[0]) // 2
+                    cv2.putText(display_frame, base_text,
+                                (text_x_pos, y - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                else:
+                    # 非自然表情时，直接显示主要情感
+                    emotion_text = f"{current_emotion}"
+                    text_size = cv2.getTextSize(emotion_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    text_x_pos = x + (w_rect - text_size[0]) // 2
+                    cv2.putText(display_frame, emotion_text,
+                                (text_x_pos, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # 显示疲劳检测标签
+                if fatigue_warning:
+                    fatigue_text = "FATIGUE!"
+                    text_size = cv2.getTextSize(fatigue_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                    text_x_pos = x + (w_rect - text_size[0]) // 2
+                    cv2.putText(display_frame, fatigue_text,
+                                (text_x_pos, y - 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            # 显示心率
+            if self.rppg_last_bpm is not None:
+                cv2.putText(display_frame, f"Heart Rate: {self.rppg_last_bpm} bpm", (text_x, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.face_mesh.process(rgb_frame)
+
+            left_iris_ellipse = None
+            right_iris_ellipse = None
+            left_eye_ellipse = None
+            right_eye_ellipse = None
+            left_relative = None
+            right_relative = None
+
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    h_img, w_img = frame.shape[:2]
+                    # 左眼虹膜检测
+                    left_iris_points = []
+                    for idx in self.LEFT_IRIS_INDICES:
+                        lm = face_landmarks.landmark[idx]
+                        x_ = int(lm.x * w_img)
+                        y_ = int(lm.y * h_img)
+                        left_iris_points.append((x_, y_))
+                    # 右眼虹膜检测
+                    right_iris_points = []
+                    for idx in self.RIGHT_IRIS_INDICES:
+                        lm = face_landmarks.landmark[idx]
+                        x_ = int(lm.x * w_img)
+                        y_ = int(lm.y * h_img)
+                        right_iris_points.append((x_, y_))
+                    # 左眼轮廓检测
+                    left_eye_points = []
+                    for idx in self.LEFT_EYE_INDICES:
+                        lm = face_landmarks.landmark[idx]
+                        left_eye_points.append((int(lm.x * w_img), int(lm.y * h_img)))
+                    # 右眼轮廓检测
+                    right_eye_points = []
+                    for idx in self.RIGHT_EYE_INDICES:
+                        lm = face_landmarks.landmark[idx]
+                        right_eye_points.append((int(lm.x * w_img), int(lm.y * h_img)))
+                    # 绘制虹膜和眼睛轮廓
+                    if len(left_iris_points) >= 5:
+                        left_iris_ellipse = cv2.fitEllipse(np.array(left_iris_points))
+                        cv2.ellipse(display_frame, left_iris_ellipse, (255, 255, 0), 1)
+                    if len(right_iris_points) >= 5:
+                        right_iris_ellipse = cv2.fitEllipse(np.array(right_iris_points))
+                        cv2.ellipse(display_frame, right_iris_ellipse, (255, 255, 0), 1)
+                    if len(left_eye_points) >= 5:
+                        left_eye_ellipse = cv2.fitEllipse(np.array(left_eye_points))
+                        cv2.ellipse(display_frame, left_eye_ellipse, (0, 255, 0), 1)
+                    if len(right_eye_points) >= 5:
+                        right_eye_ellipse = cv2.fitEllipse(np.array(right_eye_points))
+                        cv2.ellipse(display_frame, right_eye_ellipse, (0, 255, 0), 1)
+                    # 计算相对位置（加健壮性判断）
+                    if left_iris_ellipse is not None and left_eye_ellipse is not None:
+                        left_eye_center = left_eye_ellipse[0]
+                        left_iris_center = left_iris_ellipse[0]
+                        left_eye_major = left_eye_ellipse[1][0]
+                        left_eye_minor = left_eye_ellipse[1][1]
+                        if left_eye_major != 0 and left_eye_minor != 0:
+                            left_relative = (
+                                (left_iris_center[0] - left_eye_center[0]) / (left_eye_major / 2),
+                                (left_iris_center[1] - left_eye_center[1]) / (left_eye_minor / 2)
+                            )
+                    if right_iris_ellipse is not None and right_eye_ellipse is not None:
+                        right_eye_center = right_eye_ellipse[0]
+                        right_iris_center = right_iris_ellipse[0]
+                        right_eye_major = right_eye_ellipse[1][0]
+                        right_eye_minor = right_eye_ellipse[1][1]
+                        if right_eye_major != 0 and right_eye_minor != 0:
+                            right_relative = (
+                                (right_iris_center[0] - right_eye_center[0]) / (right_eye_major / 2),
+                                (right_iris_center[1] - right_eye_center[1]) / (right_eye_minor / 2)
+                            )
+            # 标定阶段保存基线
+            if not self.calibration_complete:
+                if self.is_calibrating and left_relative and right_relative:
+                    if not hasattr(self, '_eye_relative_samples'):
+                        self._eye_relative_samples = []
+                    self._eye_relative_samples.append({'left': left_relative, 'right': right_relative})
+                if self.is_calibrating is False and hasattr(self, '_eye_relative_samples') and len(self._eye_relative_samples) > 0:
+                    # 标定完成，取平均作为基线
+                    left_x = np.mean([s['left'][0] for s in self._eye_relative_samples])
+                    left_y = np.mean([s['left'][1] for s in self._eye_relative_samples])
+                    right_x = np.mean([s['right'][0] for s in self._eye_relative_samples])
+                    right_y = np.mean([s['right'][1] for s in self._eye_relative_samples])
+                    self.eye_relative_baseline = {'left': (left_x, left_y), 'right': (right_x, right_y)}
+                    del self._eye_relative_samples
+            # 检测阶段分心判断
+            distracted = False
+            if self.calibration_complete and self.eye_relative_baseline and left_relative and right_relative:
+                # 计算欧氏距离
+                l_dist = np.sqrt((left_relative[0] - self.eye_relative_baseline['left'][0]) ** 2 + (left_relative[1] - self.eye_relative_baseline['left'][1]) ** 2)
+                r_dist = np.sqrt((right_relative[0] - self.eye_relative_baseline['right'][0]) ** 2 + (right_relative[1] - self.eye_relative_baseline['right'][1]) ** 2)
+                if l_dist > 0.25 or r_dist > 0.25:
+                    # 偏移，开始计时
+                    if self.distract_start_time is None:
+                        self.distract_start_time = current_time
+                    elif current_time - self.distract_start_time >= 3.0:
+                        distracted = True
+                else:
+                    # 未偏移，重置计时
+                    self.distract_start_time = None
+            else:
+                self.distract_start_time = None
+            self.distracted = distracted
+            if distracted:
+                cv2.putText(display_frame, "Distracted!", (text_x, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            
+
+            
+            # 显示疲劳检测信息
+            if fatigue_warning:
+                cv2.putText(display_frame, "FATIGUE WARNING!", (text_x, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            elif eye_closed_frames > 0:
+                cv2.putText(display_frame, f"Eyes closed: {eye_closed_frames} frames", (text_x, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            elif yawn_frames > 0:
+                cv2.putText(display_frame, f"Yawn detected: {yawn_frames} frames", (text_x, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            # 显示视频画面
             if show_video:
-                cv2.imshow('Emotion & Heart Rate Detection', display_frame)
+                cv2.namedWindow('Emotion Detection', cv2.WINDOW_NORMAL)
+                cv2.imshow('Emotion Detection', display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.is_running = False
                     break
 
-        # Cleanup
+        # 释放资源
         if self.cap is not None:
             self.cap.release()
         if show_video:
@@ -703,33 +1004,31 @@ class EmotionDetectorCamera:
 
 if __name__ == "__main__":
     def print_result(result):
-        print(f"\nDetection time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Emotion: {result['emotion']}")
-        print(f"Micro Expression: {result.get('micro_expression', 'N/A')}")
-        print(f"Refined Emotion: {result.get('refined_emotion', 'N/A')}")
-        print(f"Confidence: {result.get('confidence', 'N/A')}")
-        if result.get('heart_rate') is not None:
-            print(f"Heart Rate: {result['heart_rate']:.1f} BPM")
-        else:
-            print("Heart Rate: Calculating...")
-        print("Probabilities for all categories:")
+        """示例回调函数，打印检测结果"""
+        print(f"\n检测时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"主要情感: {result['emotion']}")
+        if result['micro_expression']:
+            print(f"微表情: {result['micro_expression']}")
+        print("各类别概率:")
         for emo, prob in result['all_probabilities'].items():
             print(f"  {emo}: {prob * 100:.2f}%")
-        if result.get('demographics'):
-            demo = result['demographics']
-            print(f"Demographics - Age: {demo['age']}, Gender: {demo['gender']}, Race: {demo['race']}")
 
 
     try:
+        # 创建检测器实例
         detector = EmotionDetectorCamera(
-            detection_interval=0.5,
-            callback=print_result,
-            use_chinese=False
+            detection_interval=0.5,  # 每0.5秒检测一次
+            callback=print_result,  # 设置回调函数
+            use_chinese=False  # 使用英文显示
         )
+
+
+
+        # 启动检测(显示视频窗口)
         if detector.start(show_video=True):
-            print("Press 'q' to stop detection")
+            print("按 'q' 键停止检测")
             while detector.is_running:
                 time.sleep(0.1)
             detector.stop()
     except Exception as e:
-        print(f"Program error: {str(e)}")
+        print(f"程序错误: {str(e)}")

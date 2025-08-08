@@ -17,7 +17,7 @@ from src.asr.speech_recognition_engine import DashscopeSpeechRecognizer
 from src.llm.language_model import StreamingLanguageModel
 from src.tts.speech_synthesis import StreamingTTSSynthesizer
 from src.emotion.emotion_detector import DashscopeEmotionDetector, TextBasedEmotionDetector
-
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
 def init_api_key():
     """Initialize API key from environment variables or config file"""
@@ -156,7 +156,7 @@ def main():
     # Run the chatbot
     try:
         chatbot.run_continuous(
-            wake_word=args.wake_word,
+            wake_word=None,
             exit_phrase=args.exit_phrase, 
             full_response=args.full,
             activation_timeout=args.timeout
