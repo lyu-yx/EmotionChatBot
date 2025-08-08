@@ -61,8 +61,8 @@ def main():
                         help="Language for the chatbot (zh-cn or en-us)")
     parser.add_argument("--voice", "-v", default=None,
                         help="Voice ID for TTS (e.g., loongstella, xiaomo, xiaochen)")
-    parser.add_argument("--model", "-m", default="qwen-turbo",
-                        help="LLM model to use (default: qwen-turbo)")
+    parser.add_argument("--model", "-m", default="qwen-max-latest",
+                        help="LLM model to use (default: qwen-max-latest)")
     
     # Emotion detection settings
     emotion_group = parser.add_argument_group('Emotion Detection')
@@ -125,7 +125,7 @@ def main():
     
     llm = StreamingLanguageModel(
         model_name=args.model,
-        temperature=0.7,
+        temperature=0.9,
         system_prompt=system_prompt
     )
     
