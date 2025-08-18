@@ -76,8 +76,8 @@ class EmotionAwareStreamingChatbot:
 
         # Initialize streaming language model
         self.llm = llm if llm else StreamingLanguageModel(
-            model_name="qwen-max-latest",
-            temperature=0.9,
+            model_name="qwen-turbo",
+            temperature=0.7,
             system_prompt=system_prompt
         )
 
@@ -180,8 +180,15 @@ class EmotionAwareStreamingChatbot:
         
         # wake word list
         self.wake_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
+        # interrupt words (same as wake words by default)
+        self.interrupt_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
         # Lock to avoid listen confliction
         self.listen_lock = lock()
+        # Suppress the very next ASR phrase after an interrupt to avoid self Q&A
+        self._suppress_next_asr = False
+        # Local interrupt detector process handle and script path
+        self._interrupt_proc = None
+        self._interrupt_demo_path = "/home/liugezhi/桌面/123/demo.py"
         
         # Emotion monitoring thread
         self._emotion_monitor_active = False
@@ -206,9 +213,78 @@ class EmotionAwareStreamingChatbot:
             #with self.listen_lock:
                 if not self.listen_interrupt_stop.is_set():
                     try:
+                        # 如果系统正在说话：不调用ASR；仅运行/轮询本地打断检测（非阻塞）
+                        if self.is_speaking:
+                            # 启动本地打断检测进程（仅启动一次，非阻塞）
+                            if self._interrupt_proc is None and os.path.exists(self._interrupt_demo_path):
+                                try:
+                                    print("Starting local interrupt detection...")
+                                    self._interrupt_proc = subprocess.Popen([
+                                        "python3", self._interrupt_demo_path
+                                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                except Exception as e:
+                                    print(f"Failed to start local interrupt detector: {e}")
+                                    self._interrupt_proc = None
+
+                            # 轮询是否检测到打断（进程退出即表示检测到）
+                            if self._interrupt_proc is not None:
+                                ret = self._interrupt_proc.poll()
+                                if ret is not None:
+                                    # 触发打断
+                                    try:
+                                        if hasattr(self, 'tts') and hasattr(self.tts, 'request_interrupt'):
+                                            self.tts.request_interrupt()
+                                            self._suppress_next_asr = True
+                                    except Exception as e:
+                                        print(f"Interrupt request failed: {e}")
+                                    # 清空队列并回收进程句柄
+                                    try:
+                                        self.queue.clear()
+                                    except Exception:
+                                        pass
+                                    self._interrupt_proc = None
+                            result = self.recognizer.recognize_from_microphone()
+                            if result and result["text"] != '':
+                                try:
+                                    self._suppress_next_asr = False
+                                    self.queue.clear()
+                                except Exception:
+                                    pass
+                                continue
+                            if result and result["text"] in ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]:
+                                try:
+                                    self._suppress_next_asr = True
+                                    self.queue.clear()
+                                except Exception:
+                                    pass
+                                continue
+                            time.sleep(0.05)
+                            continue
+
+                        # 如果不在说话：确保任何打断检测进程被清理
+                        if self._interrupt_proc is not None:
+                            try:
+                                # 若仍在运行则终止
+                                if self._interrupt_proc.poll() is None:
+                                    self._interrupt_proc.terminate()
+                            except Exception:
+                                pass
+                            finally:
+                                self._interrupt_proc = None
+
                         # Recognize speech
                         result = self.recognizer.recognize_from_microphone()
                         if result and result["text"] != '':
+                            text_lower = result["text"].lower()
+                            # 如果处于抑制态（刚刚触发过打断），丢弃本次识别结果
+                            #if self._suppress_next_asr:
+                             #   try:
+                              #      self._suppress_next_asr = False
+                               #     self.queue.clear()
+                               # except Exception:
+                                #    pass
+                                #continue
+                            # 不在说话：正常入队
                             self.queue.put(result)
                     except Exception as e:
                         print(f"Listen thread exception: {e}")
@@ -372,6 +448,11 @@ class EmotionAwareStreamingChatbot:
             # Speak the text
             result = self.tts.speak(text)
             print("after speak")
+            #try:
+             #   self._suppress_next_asr=True
+              #  self.queue.clear()
+            #except Exception:
+             #   pass
             # Add a small delay after speaking to avoid cutting off
             #time.sleep(0.1)
             
@@ -526,7 +607,7 @@ class EmotionAwareStreamingChatbot:
                     if not self.is_speaking:
                         break
                 print("Waiting for speech to complete before listening...")
-                time.sleep(0.25)
+                time.sleep(1)
                 
             # Step 1: Listen for user input
             print("Listening for user input...")
