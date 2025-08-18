@@ -177,36 +177,67 @@ class StreamingTTSSynthesizer(TextToSpeech):
         self.interrupt_word_list = ["你好助手","您好助手","你好","您好","你好，助手","您好，助手"]
         self.queue = q()
         self.is_speaking = False
+        self.player = None
+        self._active_synthesizer = None
         
         # For prepare_synthesis feature
         self.prepared_text = None
         self.prepared_data = None
         
-    def checking_interrupt(self, synthesizer:SpeechSynthesizer ):
+    def checking_interrupt(self, synthesizer: SpeechSynthesizer):
         while not self.thread_stop_event.is_set():
+            # 外部触发中断：立即停止
+            if self.interrupt_event.is_set():
+                try:
+                    if synthesizer is not None:
+                        synthesizer.streaming_cancel()
+                except Exception as e:
+                    print(f"取消合成失败: {e}")
+                try:
+                    if self.player is not None:
+                        try:
+                            self.player.stop()
+                        except Exception:
+                            if hasattr(self.player, 'process') and self.player.process:
+                                self.player.process.kill()
+                        self.player = None
+                except Exception as e:
+                    print(f"终止播放器失败: {e}")
+                self.queue.clear()
+                self.is_speaking = False
+                break
+
             try:
                 result = self.queue.peek()
                 if result:
-                    if any(w.lower() in result["text"] for w in self.interrupt_word_list):
+                    if any(w.lower() in result["text"].lower() for w in self.interrupt_word_list):
                         self.interrupt = True
                         self.interrupt_event.set()
-                        if getattr(synthesizer, "_is_started", False):
+                        
+                        # 1. 立即取消当前合成
+                        try:
+                            synthesizer.streaming_cancel()
+                        except Exception as e:
+                            print(f"取消合成失败: {e}")
+
+                        # 2. 立即停止播放器
+                        if hasattr(self, 'player') and self.player:
                             try:
-                                synthesizer.streaming_cancel()
-                                self.queue.clear()
-                                try:
-                                    self.interrupt = False
-                                    self.thread_stop_event.set()
-                                    self.is_speaking = False
-                                except Exception as e:
-                                    print(f"Error stopping player: {e}")
-                                time.sleep(1)
-                                self.speak("我在")
-                            except Exception as e:
-                                print(f"Cancel failed: {e}")
+                                self.player.stop()
+                            except Exception:
+                                if hasattr(self.player, 'process') and self.player.process:
+                                    self.player.process.kill()
+                            self.player = None
+
+                        # 3. 清空队列和状态
+                        self.queue.clear()
+                        self.is_speaking = False
+                        
+                        return  # 退出当前监听线程
+
             except queue.Empty:
-                continue
-            time.sleep(0.1)
+                pass
+            time.sleep(0.05)  # 保持原有检测间隔
                 
     
     def _test_ffmpeg(self):
@@ -263,15 +294,15 @@ class StreamingTTSSynthesizer(TextToSpeech):
             
         try:
             # Initialize the player for audio playback
-            player = RealtimeMp3Player(verbose=False)
+            self.player = RealtimeMp3Player(verbose=False)
             
             # Check if ffmpeg is available
-            if not player.ffmpeg_path:
+            if not self.player.ffmpeg_path:
                 print("ffmpeg not available, using fallback TTS")
                 return self._use_fallback_tts(text)
             
             # Start the player
-            if not player.start():
+            if not self.player.start():
                 result["error"] = "Failed to start audio player"
                 print(result["error"])
                 return self._use_fallback_tts(text)
@@ -299,10 +330,20 @@ class StreamingTTSSynthesizer(TextToSpeech):
                     pass
                 
                 def on_data(self, data: bytes) -> None:
+                    # 中断时丢弃数据
+                    if hasattr(self, 'interrupt_checker') and self.interrupt_checker():
+                        return
                     self.had_data = True
-                    player.write(data)
+                    try:
+                        writer = getattr(self, 'get_player')()
+                        if writer is not None:
+                            writer.write(data)
+                    except Exception:
+                        pass
             # Initialize callback
             callback = TTSCallback()
+            callback.interrupt_checker = lambda: self.interrupt_event.is_set()
+            callback.get_player = lambda: self.player
             
             # Initialize TTS synthesizer - IMPORTANT: Do not specify the format parameter to use default
             try:
@@ -314,6 +355,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
             except Exception as e:
                 print(f"Error initializing TTS synthesizer: {e}")
                 return self._use_fallback_tts(text)
+            self._active_synthesizer = synthesizer
             self.check_interrupt = threading.Thread(
                 target=self.checking_interrupt,
                 args=(synthesizer,)
@@ -329,6 +371,8 @@ class StreamingTTSSynthesizer(TextToSpeech):
             for chunk in chunks:
                 # Send text to TTS engine
                 try:
+                    if self.interrupt_event.is_set():
+                        break
                     synthesizer.streaming_call(chunk)
                     self.is_speaking = True
                 except Exception as e:
@@ -338,16 +382,17 @@ class StreamingTTSSynthesizer(TextToSpeech):
             timestamp = datetime.now().timestamp()
             logging.info(f"time before speaking:{timestamp}")
             try:
-                synthesizer.streaming_complete()
+                if not self.interrupt_event.is_set():
+                    synthesizer.streaming_complete()
             except Exception as e:
                 print(f"Error in streaming_complete: {e}")
             
             # Check if synthesis was successful
-            if callback.had_data:
+            if callback.had_data and not self.interrupt_event.is_set():
                 result["success"] = True
                 # Give some time for the audio to finish playing
                 time.sleep(0.25)
-            elif self.interrupt == False:
+            elif self.interrupt == False and not self.interrupt_event.is_set():
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed
                 return self._use_fallback_tts(text)
@@ -366,13 +411,47 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 self.interrupt = False
                 self.thread_stop_event.set()
                 self.is_speaking = False
-                self.queue.clear()
-                if 'player' in locals() and player is not None:
-                    player.stop()
+                if self.interrupt_event.is_set():
+                    self.queue.clear()
+                if self.player is not None:
+                    try:
+                        self.player.stop()
+                    except Exception:
+                        if hasattr(self.player, 'process') and self.player.process:
+                            self.player.process.kill()
+                    self.player = None
+                self._active_synthesizer = None
             except Exception as e:
                 print(f"Error stopping player: {e}")
         
         return result
+
+    def request_interrupt(self):
+        """Request an immediate interrupt: stop playback and cancel synthesis."""
+        try:
+            self.interrupt = True
+            self.interrupt_event.set()
+            # Cancel ongoing synthesis
+            try:
+                if self._active_synthesizer is not None:
+                    self._active_synthesizer.streaming_cancel()
+            except Exception as e:
+                print(f"Error canceling synthesizer: {e}")
+            # Stop player immediately
+            try:
+                if self.player is not None:
+                    try:
+                        self.player.stop()
+                    except Exception:
+                        if hasattr(self.player, 'process') and self.player.process:
+                            self.player.process.kill()
+                    self.player = None
+            except Exception as e:
+                print(f"Error force stopping player: {e}")
+            # Clear any buffered inputs
+            self.queue.clear()
+        except Exception as e:
+            print(f"request_interrupt failed: {e}")
     
     def _use_fallback_tts(self, text):
         """Use offline TTS fallback
