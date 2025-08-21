@@ -28,6 +28,7 @@ class RealtimeMp3Player:
         self.play_thread = None
         self.stop_event = threading.Event()
         self.verbose = verbose
+        self._aborted = False
         
         # Find ffmpeg binary
         self.ffmpeg_path = self._find_ffmpeg()
@@ -68,6 +69,7 @@ class RealtimeMp3Player:
         self._player = None
         self.play_thread = None
         self.stop_event = threading.Event()
+        self._aborted = False
 
     def start(self):
         """Start the player"""
@@ -99,6 +101,8 @@ class RealtimeMp3Player:
             )  # initialize ffmpeg to decode mp3
             if self.verbose:
                 print('MP3 audio player started')
+            self.stop_event.clear()
+            self._aborted = False
             return True
         except subprocess.CalledProcessError as e:
             print(f'An error occurred: {e}')
@@ -108,35 +112,103 @@ class RealtimeMp3Player:
             return False
 
     def stop(self):
-        """Stop the player"""
+        """Gracefully stop the player (may play out small buffered audio)."""
         try:
+            self.stop_event.set()
             if self.ffmpeg_process and self.ffmpeg_process.stdin:
-                self.ffmpeg_process.stdin.close()
-                self.ffmpeg_process.wait()
-            if self.play_thread:
-                self.play_thread.join()
-            if self._stream:
-                # self._stream.stop_stream()
-                # self._stream.close()
-                pass
-            if self._player:
-                self._player.terminate()
+                try:
+                    self.ffmpeg_process.stdin.close()
+                except Exception:
+                    pass
             if self.ffmpeg_process:
-                self.ffmpeg_process.terminate()
+                try:
+                    self.ffmpeg_process.terminate()
+                except Exception:
+                    pass
+            if self.play_thread:
+                try:
+                    self.play_thread.join(timeout=0.5)
+                except Exception:
+                    pass
+            # Do not close shared stream here; leave it to AudioManager to reset on demand
             if self.verbose:
                 print('MP3 audio player stopped')
         except Exception as e:
             # Capture any exceptions during cleanup
             print(f'An error occurred during player shutdown: {e}')
 
+    def finalize(self, timeout: float = 3.0):
+        """Finish playback cleanly by closing encoder input and waiting for decode/play to drain.
+
+        This should be used on normal completion (non-interrupt) so that the last chunk of audio
+        is not cut off. It closes ffmpeg stdin to signal EOF, waits for the playback thread
+        to finish reading stdout and writing to the audio device, and then waits for ffmpeg
+        to exit. It does not reset or close the shared output stream.
+        """
+        try:
+            # Signal EOF to ffmpeg so it can flush and finish decoding
+            if self.ffmpeg_process and self.ffmpeg_process.stdin:
+                try:
+                    self.ffmpeg_process.stdin.close()
+                except Exception:
+                    pass
+
+            # Wait for play thread to drain stdout to the audio device
+            if self.play_thread:
+                try:
+                    self.play_thread.join(timeout=timeout)
+                except Exception:
+                    pass
+
+            # Give ffmpeg a moment to exit on its own; terminate if it lingers
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        self.ffmpeg_process.terminate()
+                    except Exception:
+                        pass
+        except Exception as e:
+            if self.verbose:
+                print(f'Finalize error: {e}')
+
+    def abort(self):
+        """Immediately abort playback: drop buffers and kill decoding."""
+        try:
+            self._aborted = True
+            self.stop_event.set()
+            # Kill ffmpeg immediately
+            if self.ffmpeg_process:
+                try:
+                    self.ffmpeg_process.kill()
+                except Exception:
+                    pass
+            # Attempt to stop playback thread quickly
+            if self.play_thread:
+                try:
+                    self.play_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+            self.ffmpeg_process = None
+        except Exception as e:
+            print(f'Abort error: {e}')
+
     def play_audio(self):
         """Read and play audio data from ffmpeg's output"""
         # Play audio with PCM data decoded by ffmpeg
         try:
             while not self.stop_event.is_set():
+                if self.ffmpeg_process is None:
+                    break
+                if self.ffmpeg_process.poll() is not None:
+                    break
                 pcm_data = self.ffmpeg_process.stdout.read(1024)
                 if pcm_data:
-                    self._stream.write(pcm_data)
+                    try:
+                        self._stream.write(pcm_data)
+                    except Exception:
+                        break
                 else:
                     break
         except Exception as e:
@@ -149,9 +221,19 @@ class RealtimeMp3Player:
         Args:
             data: MP3 audio data to be played
         """
+        if self._aborted:
+            return
         if not self.ffmpeg_process:
             print("Error: ffmpeg process not started")
             return
+        if self.stop_event.is_set():
+            return
+        # If ffmpeg has already exited, skip writes to avoid BrokenPipe
+        try:
+            if self.ffmpeg_process.poll() is not None:
+                return
+        except Exception:
+            pass
             
         try:
             self.ffmpeg_process.stdin.write(data)
@@ -164,7 +246,10 @@ class RealtimeMp3Player:
                 self.play_thread.daemon = True
                 self.play_thread.start()
         except BrokenPipeError:
-            print("Error: Broken pipe when writing to ffmpeg")
+            # ffmpeg is gone; ignore further writes
+            pass
         except Exception as e:
             # Capture any exceptions during writing
             print(f'Error when writing audio data: {type(e).__name__}: {e}')
+
+
