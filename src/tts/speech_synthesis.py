@@ -18,7 +18,15 @@ from .realtime_player import RealtimeMp3Player
 import queue
 import logging
 from datetime import datetime
+from src.core.SharedAudio import get_audio_manager
 logging.basicConfig(level=logging.INFO)
+# Silence noisy expected close logs from websocket libraries on interrupt
+try:
+    logging.getLogger("websocket").setLevel(logging.ERROR)
+    logging.getLogger("websockets").setLevel(logging.ERROR)
+    logging.getLogger("websockets.client").setLevel(logging.ERROR)
+except Exception:
+    pass
 class TextToSpeech(abc.ABC):
     """Abstract base class for text-to-speech engines"""
 
@@ -179,6 +187,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
         self.is_speaking = False
         self.player = None
         self._active_synthesizer = None
+        self._audio_manager = get_audio_manager()
         
         # For prepare_synthesis feature
         self.prepared_text = None
@@ -196,13 +205,22 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 try:
                     if self.player is not None:
                         try:
-                            self.player.stop()
+                            # Prefer immediate abort to drop any buffered audio
+                            if hasattr(self.player, 'abort'):
+                                self.player.abort()
+                            else:
+                                self.player.stop()
                         except Exception:
                             if hasattr(self.player, 'process') and self.player.process:
                                 self.player.process.kill()
                         self.player = None
                 except Exception as e:
                     print(f"终止播放器失败: {e}")
+                # Also flush shared audio output buffer so next playback starts cleanly
+                try:
+                    self._audio_manager.reset_output_stream()
+                except Exception:
+                    pass
                 self.queue.clear()
                 self.is_speaking = False
                 break
@@ -223,7 +241,10 @@ class StreamingTTSSynthesizer(TextToSpeech):
                         # 2. 立即停止播放器
                         if hasattr(self, 'player') and self.player:
                             try:
-                                self.player.stop()
+                                if hasattr(self.player, 'abort'):
+                                    self.player.abort()
+                                else:
+                                    self.player.stop()
                             except Exception:
                                 if hasattr(self.player, 'process') and self.player.process:
                                     self.player.process.kill()
@@ -232,6 +253,11 @@ class StreamingTTSSynthesizer(TextToSpeech):
                         # 3. 清空队列和状态
                         self.queue.clear()
                         self.is_speaking = False
+                        # 4. Flush shared output to immediately stop audio
+                        try:
+                            self._audio_manager.reset_output_stream()
+                        except Exception:
+                            pass
                         
                         return  # 退出当前监听线程
 
@@ -285,7 +311,7 @@ class StreamingTTSSynthesizer(TextToSpeech):
             result["error"] = "Empty text provided"
             return result
         
-        print(f"Speaking: {text}")
+        print(f"Speaking: {text[:8]}")
         
         # Check if API key is available
         if not self.api_key:
@@ -390,8 +416,12 @@ class StreamingTTSSynthesizer(TextToSpeech):
             # Check if synthesis was successful
             if callback.had_data and not self.interrupt_event.is_set():
                 result["success"] = True
-                # Give some time for the audio to finish playing
-                time.sleep(0.25)
+                # On normal completion, finalize player to drain remaining audio
+                try:
+                    if self.player is not None and hasattr(self.player, 'finalize'):
+                        self.player.finalize(timeout=3.0)
+                except Exception:
+                    pass
             elif self.interrupt == False and not self.interrupt_event.is_set():
                 result["error"] = callback.error_msg or "No audio data produced"
                 # Fall back to offline TTS if needed
@@ -411,15 +441,27 @@ class StreamingTTSSynthesizer(TextToSpeech):
                 self.interrupt = False
                 self.thread_stop_event.set()
                 self.is_speaking = False
-                if self.interrupt_event.is_set():
+                interrupted = self.interrupt_event.is_set()
+                if interrupted:
                     self.queue.clear()
                 if self.player is not None:
                     try:
-                        self.player.stop()
+                        if interrupted and hasattr(self.player, 'abort'):
+                            self.player.abort()
+                        elif hasattr(self.player, 'finalize'):
+                            self.player.finalize(timeout=3.0)
+                        else:
+                            self.player.stop()
                     except Exception:
                         if hasattr(self.player, 'process') and self.player.process:
                             self.player.process.kill()
                     self.player = None
+                # Only drop the output stream buffer when we interrupted playback
+                if interrupted:
+                    try:
+                        self._audio_manager.reset_output_stream()
+                    except Exception:
+                        pass
                 self._active_synthesizer = None
             except Exception as e:
                 print(f"Error stopping player: {e}")
@@ -441,15 +483,29 @@ class StreamingTTSSynthesizer(TextToSpeech):
             try:
                 if self.player is not None:
                     try:
-                        self.player.stop()
+                        if hasattr(self.player, 'abort'):
+                            self.player.abort()
+                        else:
+                            self.player.stop()
                     except Exception:
                         if hasattr(self.player, 'process') and self.player.process:
                             self.player.process.kill()
+                    # Ensure the playback thread has actually stopped before resetting stream
+                    try:
+                        if hasattr(self.player, 'play_thread') and self.player.play_thread:
+                            self.player.play_thread.join(timeout=1.0)
+                    except Exception:
+                        pass
                     self.player = None
             except Exception as e:
                 print(f"Error force stopping player: {e}")
             # Clear any buffered inputs
             self.queue.clear()
+            # Flush audio output stream so residual PCM is dropped
+            try:
+                self._audio_manager.reset_output_stream()
+            except Exception:
+                pass
         except Exception as e:
             print(f"request_interrupt failed: {e}")
     
@@ -703,3 +759,5 @@ class StreamingTTSSynthesizer(TextToSpeech):
             return self.speak(self.prepared_text)
             
         return result
+
+
