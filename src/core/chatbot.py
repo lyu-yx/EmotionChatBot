@@ -19,7 +19,6 @@ from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetect
 from src.emotion.identify import EmotionDetectorCamera
 from src.core.SharedQueue import SharedQueue as q
 from src.core.SharedLock import SharedLock as lock
-from src.core.buffer_config import BufferConfig
 from datetime import datetime
 import logging
 import random
@@ -77,8 +76,8 @@ class EmotionAwareStreamingChatbot:
 
         # Initialize streaming language model
         self.llm = llm if llm else StreamingLanguageModel(
-            model_name="qwen-turbo",
-            temperature=0.7,
+            model_name="qwen-max-latest",
+            temperature=0.9,
             system_prompt=system_prompt
         )
 
@@ -153,10 +152,10 @@ class EmotionAwareStreamingChatbot:
         # Tail padding config to mitigate playback tail truncation for LLM-generated speech
         try:
             padding_char = os.getenv("TTS_TAIL_PADDING_CHAR", "嗯")
-            padding_count = int(os.getenv("TTS_TAIL_PADDING_COUNT", str(BufferConfig.get_tts_tail_padding_count())))
+            padding_count = int(os.getenv("TTS_TAIL_PADDING_COUNT", "8"))
         except Exception:
             padding_char = "嗯"
-            padding_count = BufferConfig.get_tts_tail_padding_count()
+            padding_count = 8
         self._tail_padding = padding_char * max(0, padding_count)
 
         # Flag to indicate if TTS is currently active
@@ -268,7 +267,7 @@ class EmotionAwareStreamingChatbot:
                                 except Exception:
                                     pass
                                 continue
-                            time.sleep(BufferConfig.get_listen_poll_interval())  # 使用配置的轮询间隔
+                            time.sleep(0.05)
                             continue
 
                         # 如果不在说话：确保任何打断检测进程被清理
@@ -583,7 +582,7 @@ class EmotionAwareStreamingChatbot:
 
         return result
 
-    def _should_synthesize(self, min_chunk_size=None):
+    def _should_synthesize(self, min_chunk_size=20):
         """Determine if the current buffer should be synthesized
 
         Check if the text buffer contains a complete sentence or is long enough
@@ -594,8 +593,6 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Boolean indicating if synthesis should occur
         """
-        if min_chunk_size is None:
-            min_chunk_size = BufferConfig.get_text_synthesis_min_chunk_size()
         # Check for sentence ending punctuation
         for char in self.sentence_end_chars:
             if char in self.text_buffer:
@@ -723,7 +720,7 @@ class EmotionAwareStreamingChatbot:
             # 2. 唤醒后启动云端交互
             print("\nWake word detected! Starting cloud-based chatbot...")
             if language_display == "Chinese":
-                greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？"
+                greeting = "你好! 我是能够感知情绪的语音助手。请问今天我能帮您什么？嗯嗯嗯嗯嗯嗯嗯嗯"
             else:
                 greeting = "Hello! I'm an emotion-aware voice assistant. How can I help you today?"
         
@@ -828,7 +825,7 @@ class EmotionAwareStreamingChatbot:
             # Check for exit phrase
             if result["exit"] == True:
                 if language_display == "Chinese":
-                    goodbye = "再见! 祝您有美好的一天。"
+                    goodbye = "再见! 祝您有美好的一天。嗯嗯嗯嗯嗯"
                 else:
                     goodbye = "Goodbye! Have a great day."
                 self.speak(goodbye)
