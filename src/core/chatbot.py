@@ -19,6 +19,7 @@ from src.emotion.emotion_detector import EmotionDetector, DashscopeEmotionDetect
 from src.emotion.identify import EmotionDetectorCamera
 from src.core.SharedQueue import SharedQueue as q
 from src.core.SharedLock import SharedLock as lock
+from src.core.buffer_config import BufferConfig
 from datetime import datetime
 import logging
 import random
@@ -149,6 +150,15 @@ class EmotionAwareStreamingChatbot:
         # Sentence ending punctuation for splitting streaming text
         self.sentence_end_chars = ["。", "！", "？", ".", "!", "?", "；", ";"]
 
+        # Tail padding config to mitigate playback tail truncation for LLM-generated speech
+        try:
+            padding_char = os.getenv("TTS_TAIL_PADDING_CHAR", "嗯")
+            padding_count = int(os.getenv("TTS_TAIL_PADDING_COUNT", str(BufferConfig.get_tts_tail_padding_count())))
+        except Exception:
+            padding_char = "嗯"
+            padding_count = BufferConfig.get_tts_tail_padding_count()
+        self._tail_padding = padding_char * max(0, padding_count)
+
         # Flag to indicate if TTS is currently active
         self.is_speaking = False
         
@@ -258,7 +268,7 @@ class EmotionAwareStreamingChatbot:
                                 except Exception:
                                     pass
                                 continue
-                            time.sleep(0.05)
+                            time.sleep(BufferConfig.get_listen_poll_interval())  # 使用配置的轮询间隔
                             continue
 
                         # 如果不在说话：确保任何打断检测进程被清理
@@ -462,6 +472,19 @@ class EmotionAwareStreamingChatbot:
             with self.lock:
                 self.is_speaking = False
 
+    def _pad_for_tts(self, text: str) -> str:
+        """Append configured tail padding to a piece of text for TTS playback.
+
+        This only affects spoken content and does not change conversation history.
+        """
+        try:
+            padding = getattr(self, "_tail_padding", "")
+            if not padding:
+                return text
+            return f"{text}{padding}"
+        except Exception:
+            return text
+
     def process_streaming(self, user_input: str, emotion: str = "neutral", full_response: bool = False) -> Dict[str, Any]:
         """Process user input with streaming LLM and TTS, taking emotion into account
 
@@ -508,10 +531,10 @@ class EmotionAwareStreamingChatbot:
                     chunk_callback=process_chunk
                 )
 
-                # Speak the full collected response
+                # Speak the full collected response (append tail padding)
                 if collected_response:
                     print("\nSpeaking full response...")
-                    self.speak(collected_response)
+                    self.speak(self._pad_for_tts(collected_response))
             else:
                 # Define the callback function for handling text chunks (original behavior)
                 def process_chunk(chunk):
@@ -523,7 +546,7 @@ class EmotionAwareStreamingChatbot:
                         text_to_synthesize = self.text_buffer
                         self.text_buffer = ""
                         # Synthesize and play this chunk with speaking protection
-                        self.speak(text_to_synthesize)
+                        self.speak(self._pad_for_tts(text_to_synthesize))
 
                 # Call the language model with streaming enabled
                 llm_result = self.llm.generate_stream_response(
@@ -532,9 +555,9 @@ class EmotionAwareStreamingChatbot:
                     chunk_callback=process_chunk
                 )
 
-                # Process any remaining text in the buffer
+                # Process any remaining text in the buffer (append tail padding)
                 if self.text_buffer:
-                    self.speak(self.text_buffer)
+                    self.speak(self._pad_for_tts(self.text_buffer))
                     self.text_buffer = ""
 
             # Update the result
@@ -560,7 +583,7 @@ class EmotionAwareStreamingChatbot:
 
         return result
 
-    def _should_synthesize(self, min_chunk_size=20):
+    def _should_synthesize(self, min_chunk_size=None):
         """Determine if the current buffer should be synthesized
 
         Check if the text buffer contains a complete sentence or is long enough
@@ -571,6 +594,8 @@ class EmotionAwareStreamingChatbot:
         Returns:
             Boolean indicating if synthesis should occur
         """
+        if min_chunk_size is None:
+            min_chunk_size = BufferConfig.get_text_synthesis_min_chunk_size()
         # Check for sentence ending punctuation
         for char in self.sentence_end_chars:
             if char in self.text_buffer:
@@ -817,3 +842,4 @@ class EmotionAwareStreamingChatbot:
             
             # Brief pause between interactions
             time.sleep(0.25)
+
