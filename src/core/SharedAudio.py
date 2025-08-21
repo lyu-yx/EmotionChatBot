@@ -27,6 +27,24 @@ class AudioManager:
             )
         return self._output_stream
 
+    def reset_output_stream(self):
+        """Immediately stop and close the current output stream so buffered audio is dropped.
+
+        A new stream will be created on the next call to get_output_stream().
+        """
+        try:
+            if self._output_stream:
+                try:
+                    self._output_stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    self._output_stream.close()
+                except Exception:
+                    pass
+        finally:
+            self._output_stream = None
+
     def terminate(self):
         if self._mic_stream:
             self._mic_stream.stop_stream()
@@ -46,3 +64,4 @@ def get_audio_manager():
     if _audio_manager_instance is None:
         _audio_manager_instance = AudioManager()
     return _audio_manager_instance
+
